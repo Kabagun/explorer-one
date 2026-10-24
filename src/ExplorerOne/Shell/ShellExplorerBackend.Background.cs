@@ -22,8 +22,23 @@ public sealed partial class ShellExplorerBackend
             !Application.MessageLoop || SynchronizationContext.Current is not WindowsFormsSynchronizationContext)
             throw new InvalidOperationException("Background transfers require their owning WinForms STA message pump.");
         _acceptBackgroundTransfers = false;
+        if (_ownsNativeReservations && !_nativeReservationsDisposed)
+            _nativeReservations.StopPreopening();
         while (_backgroundJobs.Count != 0)
             await Task.WhenAll(_backgroundJobs.Values.Select(job => job.Completion).ToArray());
+        // An accepted native command can outlive its source hint. Let its
+        // exact handle resolve before the final owner-STA orphan cleanup;
+        // a hung/ambiguous request stays preserved after this bounded wait.
+        var nativeDeadline = Environment.TickCount64 + DestinationTimeoutMilliseconds;
+        while (!_nativeReservationsDisposed && _nativeReservations.HasPending &&
+            Environment.TickCount64 < nativeDeadline)
+        {
+            _nativeReservations.Pulse();
+            if (_nativeReservations.HasPending)
+                await Task.Delay(20);
+        }
+        if (!_disposed)
+            await ProcessPreopenCleanupAsync();
     }
 
     private bool CanStartBackgroundTransfer(RegisteredWindow source) =>
@@ -167,12 +182,17 @@ public sealed partial class ShellExplorerBackend
                     _failedBackgroundTransfers++;
                 _backgroundJobs.Remove(job.Transfer.Source);
                 if (!OriginalSourceStillLive(job))
+                {
+                    AbandonNativeReservation(job.Transfer);
                     _partialTransfers.Remove(job.Transfer);
+                }
                 job.Lifetime.Dispose();
                 if (_releaseShellAfterBackground && _backgroundJobs.Count == 0)
                 {
                     _releaseShellAfterBackground = false;
-                    try { ResetShell(); } catch { /* Shared release must not fault an already drained job. */ }
+                    try { ResetShell(); }
+                    catch { /* Shared release must not fault an already drained job. */ }
+                    finally { DisposeOwnedNativeReservations(); }
                 }
                 NotifyBackgroundTransferChanged();
             }

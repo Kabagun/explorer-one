@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using ExplorerOne.Core;
@@ -16,15 +17,18 @@ internal sealed class SourceWindowPresentation : IDisposable
     private readonly TimeProvider _clock;
     private readonly object _gate = new();
     private readonly Dictionary<WindowId, Entry> _seen = [];
+    private readonly ConcurrentDictionary<WindowId, byte> _protected = new();
+    private MainReference? _publishedMain;
     private WindowId? _mainWindow;
-    private bool _disposed;
+    private volatile bool _disposed;
 
     public SourceWindowPresentation(ISourceWindowPresentationNative? native = null, TimeProvider? clock = null)
     {
         _native = native ?? new SourceWindowPresentationNative();
         _clock = clock ?? TimeProvider.System;
         foreach (var window in _native.GetExistingWindows())
-            if (_native.IsVisible(window)) _seen.TryAdd(window, new Entry());
+            if (_native.IsVisible(window) || _native.IsMinimized(window))
+            { _seen.TryAdd(window, new Entry()); _protected.TryAdd(window, 0); }
     }
 
     public TimeSpan? NextExpiryDelay
@@ -50,8 +54,23 @@ internal sealed class SourceWindowPresentation : IDisposable
     {
         lock (_gate) OnWindowCore(source, _mainWindow, created: true);
     }
+
+    public bool TryGetPreopenTarget(WindowId source, bool created, out WindowId target)
+    {
+        // The WinEvent critical path must never wait for synchronous style
+        // writes or appearance rollback running under the presentation gate.
+        target = default;
+        var published = Volatile.Read(ref _publishedMain);
+        if (_disposed || published is null || source == published.Value || _protected.ContainsKey(source) ||
+            !_native.IsValid(source) || !_native.IsValid(published.Value) || !_native.IsVisible(published.Value) ||
+            !_native.IsVisible(source) || _native.IsMinimized(source)) return false;
+        if (_disposed || !ReferenceEquals(published, Volatile.Read(ref _publishedMain)) || _protected.ContainsKey(source)) return false;
+        target = published.Value;
+        return true;
+    }
     public void OnShown(WindowId source, WindowId? main)
     {
+        PublishMain(main);
         lock (_gate) { _mainWindow = main; OnWindowCore(source, main, created: false); }
     }
     public void OnShown(WindowId source)
@@ -83,7 +102,7 @@ internal sealed class SourceWindowPresentation : IDisposable
         if (!validMain)
         {
             // A skipped early CREATE remains eligible for a later SHOW.
-            if (!created) _seen.TryAdd(source, new Entry());
+            if (!created) { _seen.TryAdd(source, new Entry()); _protected.TryAdd(source, 0); }
             return;
         }
         // A currently visible iconic frame is not a new normal show. Invisible
@@ -106,6 +125,7 @@ internal sealed class SourceWindowPresentation : IDisposable
                 else entry.ObservedMinimized = _native.IsMinimized(source);
                 _native.Activate(main!.Value);
             }
+            if (entry.Appearance is null && !entry.OwnsMinimize && (!created || visible)) _protected.TryAdd(source, 0);
             if (created && entry.Appearance is null && !entry.OwnsMinimize) _seen.Remove(source);
         }
         catch
@@ -138,6 +158,7 @@ internal sealed class SourceWindowPresentation : IDisposable
 
     public void Observe(WindowId? main)
     {
+        PublishMain(main);
         lock (_gate) { _mainWindow = main; ObserveCore(main); }
     }
     public void ObserveCurrentMain()
@@ -148,9 +169,11 @@ internal sealed class SourceWindowPresentation : IDisposable
     {
         if (_disposed) return;
         var validMain = main.HasValue && _native.IsValid(main.Value) && _native.IsVisible(main.Value);
+        foreach (var window in _protected.Keys)
+            if (!_native.IsValid(window)) _protected.TryRemove(window, out _);
         foreach (var (window, entry) in _seen.ToArray())
         {
-            if (!_native.IsValid(window)) { _seen.Remove(window); continue; }
+            if (!_native.IsValid(window)) { _seen.Remove(window); _protected.TryRemove(window, out _); continue; }
             if (!entry.OwnsMinimize && entry.Appearance is null) continue;
             if (entry.RestorePending && SinceRestoreAttempt(entry) < RestoreRetryDelay) continue;
             var minimized = _native.IsMinimized(window);
@@ -162,6 +185,7 @@ internal sealed class SourceWindowPresentation : IDisposable
             {
                 // A user restore relinquishes both kinds of presentation
                 // ownership. A seen source can never be suppressed again.
+                _protected.TryAdd(window, 0);
                 entry.OwnsMinimize = false;
                 RestoreAppearance(window, entry);
             }
@@ -173,7 +197,7 @@ internal sealed class SourceWindowPresentation : IDisposable
         lock (_gate)
         {
             if (_disposed || !_seen.TryGetValue(source, out var entry)) return;
-            if (!_native.IsValid(source)) { _seen.Remove(source); return; }
+            if (!_native.IsValid(source)) { _seen.Remove(source); _protected.TryRemove(source, out _); return; }
             // Queued owns captured background work, not native disappearance.
             if (result is not (TransferResult.NotReady or TransferResult.Queued))
                 RestoreOwned(source, entry); // Even claimed Completed/Gone must unhide a still-live frame.
@@ -222,10 +246,24 @@ internal sealed class SourceWindowPresentation : IDisposable
     }
     private void RestoreOwned(WindowId window, Entry entry)
     {
+        _protected.TryAdd(window, 0); // Publish before potentially blocking native rollback.
         RestoreAppearance(window, entry);
-        if (!entry.OwnsMinimize) return;
-        entry.OwnsMinimize = false;
-        if (_native.IsValid(window) && (!entry.ObservedMinimized || _native.IsMinimized(window))) _native.Restore(window);
+        if (entry.OwnsMinimize)
+        {
+            entry.OwnsMinimize = false;
+            if (_native.IsValid(window) && (!entry.ObservedMinimized || _native.IsMinimized(window))) _native.Restore(window);
+        }
+        // An invisible standby CREATE is not a user-restored window. Once its
+        // original appearance is back, leave its eventual first SHOW eligible.
+        if (entry.Appearance is null && !entry.RestorePending && !entry.HasNormalShow &&
+            _native.IsValid(window) && !_native.IsVisible(window) && !_native.IsMinimized(window))
+        { _seen.Remove(window); _protected.TryRemove(window, out _); }
+    }
+    private void PublishMain(WindowId? main)
+    {
+        var current = Volatile.Read(ref _publishedMain);
+        if (main.HasValue ? current?.Value == main.Value : current is null) return;
+        Volatile.Write(ref _publishedMain, main.HasValue ? new MainReference(main.Value) : null);
     }
     public void Dispose()
     {
@@ -233,6 +271,7 @@ internal sealed class SourceWindowPresentation : IDisposable
         {
             if (_disposed) return;
             _disposed = true;
+            Volatile.Write(ref _publishedMain, null);
             RestoreAllCore();
             // A second bounded pass resolves transient rollback failures. Keep
             // any still-failed original token for an explicit RestoreAll retry.
@@ -242,6 +281,7 @@ internal sealed class SourceWindowPresentation : IDisposable
         }
     }
     private sealed record Appearance(uint Style, LayeredWindowAttributes Attributes);
+    private sealed record MainReference(WindowId Value);
     private sealed class Entry
     {
         public Appearance? Appearance { get; set; }

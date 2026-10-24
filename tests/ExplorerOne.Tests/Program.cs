@@ -202,6 +202,7 @@ cases = cases.Concat(SafetyCases.All).ToArray();
 cases = cases.Concat(LocationCases.All).ToArray();
 cases = cases.Concat(LatencyCases.All).ToArray();
 cases = cases.Concat(PresentationCases.All).ToArray();
+cases = cases.Concat(NativeTabReservationCases.All).ToArray();
 var failures = 0;
 foreach (var test in cases)
 {

@@ -1,4 +1,5 @@
 using System.Drawing;
+using System.Collections.Concurrent;
 using System.Windows.Forms;
 using ExplorerOne.Core;
 using ExplorerOne.Shell;
@@ -20,6 +21,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private WindowCoordinator? _coordinator;
     private ExplorerWakeupMonitor? _wakeupMonitor;
     private SourceWindowPresentation? _presentation;
+    private readonly NativeTabReservations _nativeReservations = new();
+    private readonly ConcurrentDictionary<(WindowId Source, bool Created), byte> _appearanceWork = new();
+    private int _presentationPulseQueued;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly ContextMenuStrip _menu = new();
     private readonly ToolStripMenuItem _statusItem = new("Ожидание Проводника") { Enabled = false };
@@ -108,13 +112,40 @@ internal sealed class TrayApplicationContext : ApplicationContext
 
         // Called on the native-only watcher thread; presentation owns its
         // synchronized main-window snapshot and makes no COM/UI-timer calls.
-        _presentation?.OnShown(source);
+        PreopenNewFrame(source, created: false);
+        QueueAppearance(source, created: false);
     }
 
     private void OnExplorerWindowCreated(WindowId source)
     {
-        if (!_shuttingDown)
-            _presentation?.OnCreated(source);
+        if (_shuttingDown) return;
+        PreopenNewFrame(source, created: true);
+        QueueAppearance(source, created: true);
+    }
+
+    private void PreopenNewFrame(WindowId source, bool created)
+    {
+        // The native command precedes appearance writes and every source COM
+        // read. The backend later claims this exact reservation for copying.
+        if (!_shuttingDown && _presentation?.TryGetPreopenTarget(source, created, out var target) == true)
+            _nativeReservations.TryPreopen(source, target);
+    }
+
+    private void QueueAppearance(WindowId source, bool created)
+    {
+        var key = (source, created);
+        if (_shuttingDown || !_appearanceWork.TryAdd(key, 0)) return;
+        _ = Task.Run(() =>
+        {
+            try
+            {
+                if (_shuttingDown) return;
+                if (created) _presentation?.OnCreated(source);
+                else _presentation?.OnShown(source);
+            }
+            catch { /* Appearance failure cannot stop native tab requests. */ }
+            finally { _appearanceWork.TryRemove(key, out _); }
+        });
     }
 
     private void OnExplorerWindowExcluded(WindowId source)
@@ -126,7 +157,16 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private void OnPresentationPulse()
     {
         if (!_shuttingDown)
-            _presentation?.ObserveCurrentMain();
+        {
+            _nativeReservations.Pulse();
+            if (Interlocked.Exchange(ref _presentationPulseQueued, 1) == 0)
+                _ = Task.Run(() =>
+                {
+                    try { if (!_shuttingDown) _presentation?.ObserveCurrentMain(); }
+                    catch { /* A stale appearance token is retried on the next pulse. */ }
+                    finally { Volatile.Write(ref _presentationPulseQueued, 0); }
+                });
+        }
     }
 
     private void SchedulePresentationExpiry()
@@ -189,7 +229,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ShellExplorerBackend? backend = null;
         try
         {
-            backend = new ShellExplorerBackend(closeSourceEarly: true);
+            backend = new ShellExplorerBackend(closeSourceEarly: true, _nativeReservations);
             backend.BackgroundTransferChanged += OnExplorerWindowLifecycle;
             backend.ShellWindowRegistered += OnExplorerWindowLifecycle;
             backend.WindowExcluded += OnExplorerWindowExcluded;
@@ -223,7 +263,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 _presentation ??= new SourceWindowPresentation();
                 _wakeupMonitorInitialized = true;
                 _wakeupMonitor = new ExplorerWakeupMonitor(OnExplorerWindowLifecycle, OnExplorerWindowShown,
-                    OnPresentationPulse, OnExplorerWindowCreated);
+                    OnPresentationPulse, OnExplorerWindowCreated, () => _nativeReservations.HasPending);
             }
             if (_coordinator is null && !TryInitializeBackend())
                 return;
@@ -238,6 +278,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 if (coordinator.LastTransfer is { } transfer)
                     _presentation?.OnTransfer(transfer.Source, transfer.Result);
                 _presentation?.Observe(coordinator.MainWindow);
+                await _backend!.ProcessPreopenCleanupAsync();
                 if (!_capturePrimed && _capturePrimeAttempts < 3 && coordinator.PendingCount == 0 &&
                     coordinator.BackgroundPendingCount == 0 && coordinator.MainWindow is { } primeMain &&
                     Environment.TickCount64 >= _nextCapturePrimeAttemptAt)
@@ -323,6 +364,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             return;
 
         _shuttingDown = true;
+        _nativeReservations.StopPreopening();
         try
         {
             try
@@ -380,6 +422,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
         try { _backend?.Dispose(); } catch { }
         _backend = null;
+        try { _nativeReservations.Dispose(); } catch { }
         _coordinator = null;
     }
 }

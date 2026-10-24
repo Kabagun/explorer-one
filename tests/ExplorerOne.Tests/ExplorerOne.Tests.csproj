@@ -5,4 +5,5 @@
   <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/ShellLocation.cs" Link="ShellLocation.cs" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/SourceStability.cs" Link="SourceStability.cs" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/SourceWindowPresentation.cs" Link="SourceWindowPresentation.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/NativeTabReservations.cs" Link="NativeTabReservations.cs" /></ItemGroup>
 </Project>

@@ -82,10 +82,22 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
     public event Action<WindowId>? WindowExcluded;
 
     public ShellExplorerBackend(bool closeSourceEarly = false)
+        : this(closeSourceEarly, new NativeTabReservations(), ownsNativeReservations: true)
+    {
+    }
+
+    internal ShellExplorerBackend(bool closeSourceEarly, NativeTabReservations nativeReservations)
+        : this(closeSourceEarly, nativeReservations, ownsNativeReservations: false)
+    {
+    }
+
+    private ShellExplorerBackend(bool closeSourceEarly, NativeTabReservations nativeReservations, bool ownsNativeReservations)
     {
         AssertContext();
         _ownerContext = SynchronizationContext.Current!;
         _closeSourceEarly = closeSourceEarly;
+        _nativeReservations = nativeReservations;
+        _ownsNativeReservations = ownsNativeReservations;
     }
 
     public IReadOnlyList<ExplorerWindow> EnumerateWindows()
@@ -102,6 +114,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                 throw new ShellSnapshotException();
             foreach (var id in excluded)
             {
+                _nativeReservations.AbandonEarly(id);
                 try { WindowExcluded?.Invoke(id); }
                 catch { /* Presentation notifications cannot change discovery. */ }
             }
@@ -153,6 +166,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         DiagnosticActivationMilliseconds = 0;
         DiagnosticInitialCaptureMilliseconds = 0;
         DiagnosticLoadingFileCaptureCount = 0;
+        DiagnosticEarlyTabAdoptions = 0;
         DiagnosticFinalVerifyMilliseconds = 0;
         DiagnosticCloseCallMilliseconds = 0;
         DiagnosticCloseWaitMilliseconds = 0;
@@ -164,7 +178,10 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         if (source == target || source.Handle == target.Handle || !IsExplorerWindow(target))
             return TransferResult.Unsafe;
         if (!IsExplorerWindow(source))
+        {
+            _nativeReservations.AbandonEarly(source);
             return TransferResult.SourceGone;
+        }
 
         _transferring = true;
         var transferStartedAt = Stopwatch.GetTimestamp();
@@ -351,10 +368,12 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+            AbandonUnclaimedPreopen(source, target);
             return TransferResult.Retry;
         }
         catch (UnsupportedShellViewException exception)
         {
+            AbandonUnclaimedPreopen(source, target);
             RecordDiagnosticFailure(exception);
             return TransferResult.Unsafe;
         }
@@ -367,6 +386,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         {
             RecordDiagnosticFailure(exception);
             DiagnosticPhase = "source-not-ready";
+            if (!IsExplorerWindow(source))
+                AbandonUnclaimedPreopen(source, target);
             return IsExplorerWindow(source) ? TransferResult.NotReady : TransferResult.SourceGone;
         }
         catch (Exception exception)
@@ -374,6 +395,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
             RecordDiagnosticFailure(exception);
             // The host reports only this classification, never private shell
             // paths or raw automation exception messages.
+            if (!IsExplorerWindow(source))
+                AbandonUnclaimedPreopen(source, target);
             return IsExplorerWindow(source) ? TransferResult.Retry : TransferResult.SourceGone;
         }
         finally
@@ -576,6 +599,17 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                         DiagnosticTabReadyMilliseconds += ElapsedMilliseconds(tabRequestedAt);
                     }
                     ValidateReference(reference, transfer.Target);
+                    if (!transfer.NavigationIssued && transfer.AdoptedEarly && !transfer.EarlyDestinationValidated)
+                    {
+                        // The early tab was visible before its source could be
+                        // captured. Preserve any user navigation/selection.
+                        var early = CaptureTab(reference);
+                        var alreadyCopied = SameTabContents(transfer.SourceState, early);
+                        if (!alreadyCopied && !IsEmptyHome(early))
+                            throw new UnsupportedShellViewException();
+                        transfer.EarlyDestinationValidated = true;
+                        transfer.NavigationIssued = alreadyCopied;
+                    }
                     if (!transfer.NavigationIssued)
                     {
                         // The default Home view need not be portable. Navigate
@@ -609,6 +643,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                         transfer.Verified = true;
                         transfer.LastManagedState = current;
                         transfer.RebaseFrom = null;
+                        CompleteNativeReservation(transfer);
                         return true;
                     }
                     if (transfer.Verified)
@@ -638,6 +673,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                                 DiagnosticNavigationReadyMilliseconds += ElapsedMilliseconds(navigationStartedAt.Value);
                             transfer.Verified = true;
                             transfer.LastManagedState = selected;
+                            CompleteNativeReservation(transfer);
                             return true;
                         }
                     }
@@ -1401,13 +1437,13 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
 
     private void PruneVanishedTransfers()
     {
+        foreach (var transfer in _partialTransfers.Where(transfer => !IsOwnedBackgroundTransfer(transfer) &&
+            (!IsExplorerWindow(transfer.Source) || !IsExplorerWindow(transfer.Target))))
+            AbandonNativeReservation(transfer);
         _partialTransfers.RemoveAll(transfer => !IsOwnedBackgroundTransfer(transfer) &&
             (!IsExplorerWindow(transfer.Source) || !IsExplorerWindow(transfer.Target)));
         PrunePreparedSource();
-        // A vanished source does not cancel a posted tab command. Keep that
-        // global reservation until its handle is resolved or the target dies.
-        if (_pendingAllocation is not null && !IsExplorerWindow(_pendingAllocation.Target))
-            _pendingAllocation = null;
+        _nativeReservations.Pulse(); // Pending commands remain globally owned until resolved or invalidated.
     }
 
     private void RecordDiagnosticFailure(Exception exception)
@@ -1446,8 +1482,9 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
             PruneVanishedTransfers();
         else
         {
+            foreach (var transfer in _partialTransfers)
+                AbandonNativeReservation(transfer);
             _partialTransfers.Clear();
-            _pendingAllocation = null;
         }
         _generation++;
     }
@@ -1462,7 +1499,10 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         DisposeShellWindowEvents(); // Detach now; pumped work cannot reattach during Unadvise.
         foreach (var job in _backgroundJobs.Values.ToArray()) job.Cancel();
         if (_backgroundJobs.Count == 0)
+        {
             ResetShell();
+            DisposeOwnedNativeReservations();
+        }
         else
             _releaseShellAfterBackground = true; // Never block the owning STA or release RCWs under a live job.
     }
@@ -1499,12 +1539,12 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         internal TabState SourceState { get; set; } = sourceState;
         internal TabState? LastManagedState { get; set; }
         internal TabState? RebaseFrom { get; set; }
-        internal HashSet<nint> TargetBefore { get; set; } = [];
+        internal NativeTabReservation? NativeReservation { get; set; }
+        internal bool AdoptedEarly { get; set; }
+        internal bool EarlyDestinationValidated { get; set; }
         internal nint TargetTab { get; set; }
-        internal bool NewTabRequested { get; set; }
         internal bool NavigationIssued { get; set; }
         internal bool Verified { get; set; }
-        internal bool AllocationAmbiguous { get; set; }
         internal bool BackgroundOwned { get; set; }
     }
 

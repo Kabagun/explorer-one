@@ -42,6 +42,7 @@ internal static class ShellNative
     internal const uint WmCommand = 0x0111;
     internal const uint WmClose = 0x0010;
     internal const nuint NewTabCommand = 0xA21B;
+    internal const nuint CloseTabCommand = 0xA021;
     internal const uint AbortIfHung = 0x0002;
     internal const uint ErrorOnExit = 0x0020;
     internal const uint RootAncestor = 2;
@@ -49,6 +50,15 @@ internal static class ShellNative
     internal const uint ParentRelativeParsing = 0x80018001;
 
     internal delegate bool EnumWindowsCallback(nint window, nint parameter);
+
+    // WinUser.h GUITHREADINFO; HWND fields and RECT use the native process layout.
+    [StructLayout(LayoutKind.Sequential)]
+    internal struct GuiThreadInfo
+    {
+        internal uint Size, Flags;
+        internal nint Active, Focus, Capture, MenuOwner, MoveSize, Caret;
+        internal int Left, Top, Right, Bottom;
+    }
 
     [DllImport("user32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
@@ -62,6 +72,13 @@ internal static class ShellNative
 
     [DllImport("user32.dll")]
     internal static extern uint GetWindowThreadProcessId(nint window, out uint processId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetGUIThreadInfo(uint thread, ref GuiThreadInfo information);
+
+    [DllImport("user32.dll")]
+    internal static extern nint GetParent(nint window);
 
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]

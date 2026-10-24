@@ -6,8 +6,6 @@ namespace ExplorerOne.Shell;
 
 public sealed partial class ShellExplorerBackend
 {
-    private readonly SemaphoreSlim _tabAllocation = new(1, 1);
-    private PartialTransfer? _pendingAllocation;
     private WindowId? _nextPreparationCandidate;
     private WindowId _nextPreparationTarget;
     private PreparedOtherSource? _preparedOtherSource;
@@ -243,30 +241,25 @@ public sealed partial class ShellExplorerBackend
             return true;
         }
         var startedAt = Stopwatch.GetTimestamp();
-        await _tabAllocation.WaitAsync(cancellationToken);
         try
         {
             RefreshTransferShell(transfer, generation);
             if (generation != _generation || (!transfer.BackgroundOwned && !IsExplorerWindow(transfer.Source)) || !IsExplorerWindow(transfer.Target))
                 throw new ShellSnapshotException();
-            if (_pendingAllocation is not null && _pendingAllocation != transfer && !TryResolveAllocation(_pendingAllocation))
-                return false; // No new Ctrl+T while any older request is unresolved.
-            if (!transfer.NewTabRequested)
+            if (transfer.NativeReservation is null)
             {
-                transfer.TargetBefore = ReadNativeTabs(transfer.Target).ToHashSet();
-                var active = ShellNative.FindWindowEx(transfer.Target.Handle, 0, "ShellTabWindowClass", null);
-                if (!transfer.TargetBefore.Contains(active))
-                    throw new ShellSnapshotException();
-                transfer.NewTabRequested = true;
-                _pendingAllocation = transfer;
-                DiagnosticPhase = "request-new-tab";
-                ActivateTarget(transfer.Target);
-                if (!ShellNative.PostMessage(active, ShellNative.WmCommand, ShellNative.NewTabCommand, 0))
-                    throw new ShellSnapshotException();
-            }
-            else
-            {
-                _pendingAllocation = transfer;
+                transfer.NativeReservation = _nativeReservations.ClaimEarly(transfer.Source, transfer.Target, transfer);
+                if (transfer.NativeReservation is null)
+                {
+                    DiagnosticPhase = "request-new-tab";
+                    ActivateTarget(transfer.Target);
+                    transfer.NativeReservation = _nativeReservations.GetOrRequest(transfer.Source, transfer.Target, transfer);
+                }
+                if (transfer.NativeReservation is null)
+                    return false;
+                transfer.AdoptedEarly = transfer.NativeReservation.WasEarly;
+                if (transfer.AdoptedEarly)
+                    DiagnosticEarlyTabAdoptions++;
             }
             var deadline = Environment.TickCount64 + DestinationTimeoutMilliseconds;
             while (Environment.TickCount64 < deadline)
@@ -276,41 +269,30 @@ public sealed partial class ShellExplorerBackend
                 if (generation != _generation || (!transfer.BackgroundOwned && !IsExplorerWindow(transfer.Source)) || !IsExplorerWindow(transfer.Target))
                     throw new ShellSnapshotException();
                 DiagnosticPhase = "wait-native-tab";
-                if (TryResolveAllocation(transfer))
-                    return true;
+                var state = _nativeReservations.PollResolve(transfer.NativeReservation);
+                switch (state.Status)
+                {
+                    case NativeTabReservationStatus.Resolved:
+                    case NativeTabReservationStatus.Completed:
+                        if (state.IsAbandoned || !NativeTabBelongsTo(transfer.Target, state.TargetTab))
+                            throw new UnsupportedShellViewException();
+                        transfer.TargetTab = state.TargetTab;
+                        return true; // COM registration/navigation never holds the global native allocator.
+                    case NativeTabReservationStatus.Ambiguous:
+                        throw new NativeAllocationAmbiguityException();
+                    case NativeTabReservationStatus.Invalidated:
+                    case NativeTabReservationStatus.PostFailed:
+                    case NativeTabReservationStatus.Abandoned:
+                        throw new ShellSnapshotException();
+                }
                 await Task.Delay(PollMilliseconds, cancellationToken);
             }
             return false;
         }
         finally
         {
-            _tabAllocation.Release();
             DiagnosticAllocationMilliseconds += ElapsedMilliseconds(startedAt);
         }
-    }
-
-    private bool TryResolveAllocation(PartialTransfer transfer)
-    {
-        if (!IsExplorerWindow(transfer.Target))
-        {
-            if (_pendingAllocation == transfer) _pendingAllocation = null;
-            return true; // The old HWND+PID cannot receive a later command.
-        }
-        if (transfer.AllocationAmbiguous)
-            throw new NativeAllocationAmbiguityException();
-        var added = ReadNativeTabs(transfer.Target).Where(tab => !transfer.TargetBefore.Contains(tab)).ToArray();
-        if (added.Length > 1)
-        {
-            transfer.AllocationAmbiguous = true;
-            throw new NativeAllocationAmbiguityException();
-        }
-        if (added.Length == 0)
-            return false;
-        transfer.TargetTab = added[0];
-        if (!NativeTabBelongsTo(transfer.Target, transfer.TargetTab))
-            throw new ShellSnapshotException();
-        if (_pendingAllocation == transfer) _pendingAllocation = null;
-        return true; // Release allocation lock BEFORE COM registration/navigation.
     }
 
     private sealed class NativeAllocationAmbiguityException : Exception

@@ -5,6 +5,89 @@ internal static class PresentationCases
 {
     internal static IEnumerable<(string Name, Func<Task> Run)> All =>
     [
+        ("Preopen eligibility cannot wait for a blocked appearance style write", async () =>
+        {
+            var main = Id(1); var source = Id(2); var next = Id(3);
+            using var entered = new ManualResetEventSlim();
+            using var release = new ManualResetEventSlim();
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            using var presentation = new SourceWindowPresentation(native);
+            native.AddWindow(source); native.AddWindow(next);
+            native.BeforeStyleWrite = () => { entered.Set(); release.Wait(TimeSpan.FromSeconds(5)); };
+            // OnShown must publish main even while it owns a blocked appearance gate.
+            var appearance = Task.Factory.StartNew(() => presentation.OnShown(source, main),
+                CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+            Task<bool>? eligibility = null;
+            try
+            {
+                Check(entered.Wait(TimeSpan.FromSeconds(2)));
+                eligibility = Task.Factory.StartNew(() => presentation.TryGetPreopenTarget(next, created: true, out var target) && target == main,
+                    CancellationToken.None, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+                Check(await Task.WhenAny(eligibility, Task.Delay(100)) == eligibility && await eligibility);
+            }
+            finally { release.Set(); await appearance; if (eligibility is not null) await eligibility; }
+        }),
+        ("An expired invisible standby CREATE remains eligible at its first real SHOW", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            var clock = new FakeClock();
+            using var presentation = new SourceWindowPresentation(native, clock);
+            presentation.Observe(main); native.AddWindow(source, visible: false);
+            presentation.OnCreated(source);
+            Check(native.Attributes(source).Alpha == 0);
+            clock.Advance(TimeSpan.FromSeconds(4)); presentation.ObserveCurrentMain();
+            Check(native.Style(source) == 0 && presentation.NextExpiryDelay is null);
+            native.SetVisible(source, true);
+            Check(presentation.TryGetPreopenTarget(source, created: false, out var target) && target == main);
+            presentation.OnShown(source);
+            Check(native.Attributes(source).Alpha == 0 && native.Style(source) == 0x80000);
+            presentation.OnTransfer(source, TransferResult.Unsafe);
+            Check(!presentation.TryGetPreopenTarget(source, created: false, out _));
+            return Task.CompletedTask;
+        }),
+        ("Preopen waits for a real show but precedes appearance writes and COM", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(source, visible: false);
+            Check(!presentation.TryGetPreopenTarget(source, created: true, out _));
+            Check(!presentation.TryGetPreopenTarget(source, created: false, out _));
+            native.AddWindow(source, visible: true);
+            Check(presentation.TryGetPreopenTarget(source, created: true, out var target) && target == main);
+            Check(native.StyleWrites == 0 && native.MinimizeAttempts.Count == 0);
+            return Task.CompletedTask;
+        }),
+        ("Startup, main, and iconic frames never request speculative tabs", () =>
+        {
+            var main = Id(1); var existing = Id(2); var iconic = Id(3);
+            var native = new FakeNative(main, existing);
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(iconic, minimized: true);
+            Check(!presentation.TryGetPreopenTarget(main, created: true, out _));
+            Check(!presentation.TryGetPreopenTarget(existing, created: true, out _));
+            Check(!presentation.TryGetPreopenTarget(iconic, created: true, out _));
+            return Task.CompletedTask;
+        }),
+        ("Restored sources and a lost main cannot request another preopened tab", () =>
+        {
+            var main = Id(1); var source = Id(2); var next = Id(3);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(source);
+            presentation.OnShown(source);
+            Check(presentation.TryGetPreopenTarget(source, created: false, out _));
+            presentation.OnTransfer(source, TransferResult.Unsafe);
+            Check(!presentation.TryGetPreopenTarget(source, created: false, out _));
+            native.AddWindow(next);
+            native.AddWindow(main, valid: false);
+            Check(!presentation.TryGetPreopenTarget(next, created: true, out _));
+            return Task.CompletedTask;
+        }),
         ("CREATE suppresses a new invisible frame before SHOW without minimizing", () =>
         {
             var main = Id(1); var source = Id(2);
@@ -514,6 +597,7 @@ internal static class PresentationCases
         internal int AlphaWriteFailures { get; set; }
         internal int StyleWriteFailures { get; set; }
         internal int StyleWrites { get; private set; }
+        internal Action? BeforeStyleWrite { get; set; }
 
         internal FakeNative(params WindowId[] existing)
         {
@@ -541,6 +625,7 @@ internal static class PresentationCases
         { style = IsValid(window) ? _windows[window].Style : 0; return AppearanceAvailable && IsValid(window); }
         public bool TrySetExtendedStyle(WindowId window, uint style)
         {
+            BeforeStyleWrite?.Invoke();
             StyleWrites++;
             if (!IsValid(window)) return false;
             if (StyleWriteFailures > 0) { StyleWriteFailures--; return false; }

@@ -23,15 +23,18 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
     private readonly Action<WindowId> _windowShown;
     private readonly Action<WindowId>? _windowCreated;
     private readonly Action? _presentationPulse;
+    private readonly Func<bool>? _nativeWorkPending;
     private readonly WindowsFormsSynchronizationContext _ownerContext;
     private readonly WinEventCallback _callback;
     private readonly Thread _worker;
     private readonly object _queueGate = new();
     private uint _workerThreadId;
     private int _queueReady, _active, _disposed, _pollPosted;
+    private nuint _pulseTimer;
+    private uint _pulseInterval;
 
     public ExplorerWakeupMonitor(Action requestPoll, Action<WindowId> windowShown, Action? presentationPulse = null,
-        Action<WindowId>? windowCreated = null)
+        Action<WindowId>? windowCreated = null, Func<bool>? nativeWorkPending = null)
     {
         ArgumentNullException.ThrowIfNull(requestPoll);
         ArgumentNullException.ThrowIfNull(windowShown);
@@ -41,6 +44,7 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
         _windowShown = windowShown;
         _windowCreated = windowCreated;
         _presentationPulse = presentationPulse;
+        _nativeWorkPending = nativeWorkPending;
         _callback = OnWinEvent;
         _worker = new Thread(RunHookLoop) { IsBackground = true, Name = "ExplorerOne native window hints" };
         try
@@ -65,7 +69,6 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
         nint hook = 0;
         nint foregroundHook = 0;
         nint minimizeEndHook = 0;
-        nuint timer = 0;
         try
         {
             Volatile.Write(ref _workerThreadId, GetCurrentThreadId());
@@ -86,7 +89,10 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
             minimizeEndHook = SetWinEventHook(EventSystemMinimizeEnd, EventSystemMinimizeEnd, 0, callback, 0, 0,
                 WinEventOutOfContext | WinEventSkipOwnProcess);
             if (_presentationPulse is not null)
-                timer = SetTimer(0, 0, 250, 0); // Null TIMERPROC -> WM_TIMER on this native queue.
+            {
+                _pulseInterval = 250;
+                _pulseTimer = SetTimer(0, 0, _pulseInterval, 0);
+            }
             if (Volatile.Read(ref _disposed) != 0) return;
             if (hook != 0 || foregroundHook != 0 || minimizeEndHook != 0)
             {
@@ -101,10 +107,11 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
                 // GetMessage returns -1 on failure, zero on WM_QUIT.
                 if (GetMessage(out var message, 0, 0, 0) <= 0) break;
                 if (Volatile.Read(ref _disposed) != 0) break;
-                if (timer != 0 && message.Window == 0 && message.Message == WmTimer && message.WParam == timer)
+                if (_pulseTimer != 0 && message.Window == 0 && message.Message == WmTimer && message.WParam == _pulseTimer)
                 {
                     try { _presentationPulse?.Invoke(); }
                     catch { /* A stale native window cannot terminate the hook pump. */ }
+                    RefreshPulseInterval();
                     continue;
                 }
                 _ = TranslateMessage(ref message);
@@ -118,7 +125,8 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
         finally
         {
             Volatile.Write(ref _active, 0);
-            if (timer != 0) _ = KillTimer(0, timer);
+            if (_pulseTimer != 0) _ = KillTimer(0, _pulseTimer);
+            _pulseTimer = 0;
             if (minimizeEndHook != 0) _ = UnhookWinEvent(minimizeEndHook);
             if (foregroundHook != 0) _ = UnhookWinEvent(foregroundHook);
             if (hook != 0) _ = UnhookWinEvent(hook);
@@ -166,12 +174,26 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
                 catch { /* Presentation failure must not suppress the poll hint. */ }
             }
             PostOwnerPoll();
+            RefreshPulseInterval();
         }
         catch
         {
             // Queued accessibility events can outlive their window/process.
             // Never propagate managed exceptions across the user32 callback.
         }
+    }
+
+    private void RefreshPulseInterval()
+    {
+        // Native allocation resolution must not wait for the COM actor. A
+        // short timer is active only while posted/queued requests need work.
+        if (_pulseTimer == 0 || Volatile.Read(ref _disposed) != 0) return;
+        uint interval;
+        try { interval = _nativeWorkPending?.Invoke() == true ? 10u : 250u; }
+        catch { interval = 250; }
+        if (interval == _pulseInterval) return;
+        var timer = SetTimer(0, _pulseTimer, interval, 0);
+        if (timer != 0) { _pulseTimer = timer; _pulseInterval = interval; }
     }
 
     private void PostOwnerPoll()

@@ -94,6 +94,7 @@ public sealed partial class ShellExplorerBackend
                     return false;
                 if (classification.Value)
                 {
+                    _nativeReservations.AbandonEarly(main.Id);
                     try { WindowExcluded?.Invoke(main.Id); }
                     catch { /* Native presentation restoration cannot affect eligibility. */ }
                     return false;
