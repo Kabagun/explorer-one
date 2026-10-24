@@ -43,7 +43,9 @@ public sealed partial class ShellExplorerBackend
 
     private bool CanStartBackgroundTransfer(RegisteredWindow source) =>
         _closeSourceEarly && _acceptBackgroundTransfers && _backgroundJobs.Count < MaximumBackgroundTransfers &&
-        source.Tabs.Count == 1 && !_partialTransfers.Any(transfer => transfer.Source == source.Id);
+        source.Tabs.Count == 1 && (!_partialTransfers.Any(transfer => transfer.Source == source.Id) ||
+            _partialTransfers.Count(transfer => transfer.Source == source.Id) == 1 &&
+            _partialTransfers.Single(transfer => transfer.Source == source.Id).SourceCapturePending);
 
     private bool IsOwnedBackgroundTransfer(PartialTransfer transfer) =>
         _backgroundJobs.TryGetValue(transfer.Source, out var job) && ReferenceEquals(job.Transfer, transfer);
@@ -61,14 +63,24 @@ public sealed partial class ShellExplorerBackend
             throw new ShellSnapshotException();
 
         var transfer = GetOrCreateTransfer(captured.Id, target, captured.Tabs[0]);
+        if (transfer.SourceCapturePending)
+        {
+            if (transfer.NativeFallback is null || transfer.SourceState.Handle != captured.Tabs[0].Handle ||
+                !_paths!.Equivalent(transfer.NativeFallback.Location, captured.Tabs[0].Location))
+                throw new UnsupportedShellViewException();
+            transfer.SourceState = captured.Tabs[0];
+            transfer.SourceCapturePending = false;
+        }
         transfer.BackgroundOwned = true;
         var job = new BackgroundTransferJob(transfer, captured.Tabs[0], generation);
         _backgroundJobs.Add(captured.Id, job);
         _ = RunBackgroundTransferAsync(job); // Completion is owned before the runner's synchronous prefix starts.
         try
         {
-            // The task's synchronous prefix can allocate/post Ctrl+T only.
-            // Its fast-only yield precedes every destination COM lookup.
+            if (transfer.NativeFallback?.Dispatch is { } directDispatch)
+                RecordNativeFallbackResult(transfer, await directDispatch);
+            // The synchronous prefix dispatches a direct native folder request
+            // or legacy tab allocation. Its yield precedes destination COM.
             if (job.Completion.IsCompleted || cancellationToken.IsCancellationRequested || !_acceptBackgroundTransfers ||
                 !HasTransferShell(generation) || !IsExplorerWindow(target) ||
                 !NativeTabsMatch(captured.Id, [job.Original.Handle]))
@@ -80,6 +92,14 @@ public sealed partial class ShellExplorerBackend
             if (sourceReference.Handle != job.Original.Handle)
                 throw new ShellSnapshotException();
             ValidateReference(sourceReference, captured.Id);
+            if (transfer.NativeFallback is { } direct && (!direct.Accepted || direct.CreatedTab == 0 ||
+                !NativeTabBelongsTo(target, direct.CreatedTab) ||
+                CaptureTab(sourceReference, allowLoadingFileView: true).Stamp != job.Original.Stamp))
+            {
+                job.Cancel();
+                await job.Completion;
+                return IsExplorerWindow(captured.Id) ? TransferResult.Retry : TransferResult.SourceGone;
+            }
             // Source COM validation may pump messages and finish/fail the job.
             // Recheck ownership AFTER it; all remaining pre-commit checks are native.
             if (job.Completion.IsCompleted || !IsOwnedBackgroundTransfer(transfer) ||

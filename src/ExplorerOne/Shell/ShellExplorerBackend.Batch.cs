@@ -240,6 +240,9 @@ public sealed partial class ShellExplorerBackend
                 throw new UnsupportedShellViewException();
             return true;
         }
+        var nativeFolder = await TryEnsureNativeFallbackTabAsync(transfer, generation, cancellationToken);
+        if (nativeFolder.HasValue) return nativeFolder.Value;
+        if (_nativeFallbackAllocation is not null) return false;
         var startedAt = Stopwatch.GetTimestamp();
         try
         {

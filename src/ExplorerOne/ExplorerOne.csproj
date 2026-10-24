@@ -7,6 +7,25 @@
     <AssemblyName>ExplorerOne</AssemblyName>
     <Description>One native Windows Explorer window with tabs</Description>
     <Authors>Kabaye</Authors>
+    <PlatformTarget>x64</PlatformTarget>
+    <ExplorerOnePowerShell Condition="'$(ExplorerOnePowerShell)' == '' and Exists('$(USERPROFILE)/Programs/PowerShell/7/pwsh.exe')">$(USERPROFILE)/Programs/PowerShell/7/pwsh.exe</ExplorerOnePowerShell>
+    <ExplorerOnePowerShell Condition="'$(ExplorerOnePowerShell)' == ''">pwsh.exe</ExplorerOnePowerShell>
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../ExplorerOne.Core/ExplorerOne.Core.csproj" /></ItemGroup>
+  <ItemGroup>
+    <Content Include="../ExplorerOne.RouterNative/vendor/minhook-1.3.4/LICENSE.txt" Link="MinHook.LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="BuildNativeLaunchRouter" BeforeTargets="PrepareForBuild;GetCopyToPublishDirectoryItems"
+          Condition="'$(OS)' == 'Windows_NT' and '$(SkipNativeBuild)' != 'true'">
+    <PropertyGroup><NativeRouterOutput>$(MSBuildProjectDirectory)/obj/native-router/$(Configuration)</NativeRouterOutput></PropertyGroup>
+    <Exec WorkingDirectory="$(MSBuildProjectDirectory)"
+          Command="&quot;$(ExplorerOnePowerShell)&quot; -NoProfile -File &quot;$(MSBuildProjectDirectory)/../ExplorerOne.RouterNative/build.ps1&quot; -Configuration &quot;$(Configuration)&quot; -OutputDirectory &quot;$(NativeRouterOutput)&quot;" />
+    <ReadLinesFromFile File="$(NativeRouterOutput)/ExplorerOne.NativeLaunchRouter.current">
+      <Output TaskParameter="Lines" ItemName="NativeRouterDllName" />
+    </ReadLinesFromFile>
+    <ItemGroup>
+      <Content Include="@(NativeRouterDllName->'$(NativeRouterOutput)/%(Identity)')" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+      <Content Include="$(NativeRouterOutput)/ExplorerOne.NativeLaunchRouter.current" Link="ExplorerOne.NativeLaunchRouter.current" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
 </Project>

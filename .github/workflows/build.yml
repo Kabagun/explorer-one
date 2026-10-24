@@ -25,6 +25,10 @@ jobs:
       - name: Run tests
         run: dotnet run --project tests/ExplorerOne.Tests -c Release
 
+      - name: Run native protocol tests
+        shell: pwsh
+        run: ./tests/ExplorerOne.Native.Tests/run.ps1
+
       - name: Build application
         run: dotnet build src/ExplorerOne/ExplorerOne.csproj -c Release
 

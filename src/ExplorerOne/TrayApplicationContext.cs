@@ -6,7 +6,7 @@ using ExplorerOne.Shell;
 
 namespace ExplorerOne;
 
-internal sealed class TrayApplicationContext : ApplicationContext
+internal sealed partial class TrayApplicationContext : ApplicationContext
 {
     private const string GenericPollError = "Не удалось выполнить проверку.";
     private const int IdlePollMilliseconds = 1000;
@@ -75,6 +75,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             }
 
             _notifyIcon.Visible = true;
+            InitializeFolderOpening();
             _pollTimer.Start();
         }
         catch
@@ -127,7 +128,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
     {
         // The native command precedes appearance writes and every source COM
         // read. The backend later claims this exact reservation for copying.
-        if (!_shuttingDown && _presentation?.TryGetPreopenTarget(source, created, out var target) == true)
+        if (!_shuttingDown && !_directFolderTabsEnabled &&
+            _presentation?.TryGetPreopenTarget(source, created, out var target) == true)
             _nativeReservations.TryPreopen(source, target);
     }
 
@@ -275,6 +277,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 _pollRequested = false;
                 _presentation?.Observe(coordinator.MainWindow);
                 await coordinator.PollAsync(_lifetime.Token, preferFastDiscovery: RegistrationBurstActive);
+                await RefreshNativeRoutingAsync();
                 if (coordinator.LastTransfer is { } transfer)
                     _presentation?.OnTransfer(transfer.Source, transfer.Result);
                 _presentation?.Observe(coordinator.MainWindow);
@@ -380,6 +383,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             catch { }
 
             try { _lifetime.Cancel(); } catch { }
+            try { await ShutdownFolderOpeningAsync(); } catch { }
 
             try
             {

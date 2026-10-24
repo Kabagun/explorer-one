@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
 using System.Text;
 using ExplorerOne.Core;
+using ExplorerOne.Opening;
 
 namespace ExplorerOne;
 
@@ -41,7 +42,7 @@ internal sealed class SourceWindowPresentation : IDisposable
                 foreach (var entry in _seen.Values)
                 {
                     if (!entry.OwnsMinimize && entry.Appearance is null) continue;
-                    var remaining = entry.RestorePending ? RestoreRetryDelay - SinceRestoreAttempt(entry) : PresentationTimeout - Age(entry);
+                    var remaining = entry.RestorePending ? RestoreRetryDelay - SinceRestoreAttempt(entry) : entry.Lifetime - Age(entry);
                     remaining = remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
                     if (!earliest.HasValue || remaining < earliest.Value) earliest = remaining;
                 }
@@ -85,13 +86,14 @@ internal sealed class SourceWindowPresentation : IDisposable
         if (!_native.IsValid(source)) return;
         if (_seen.TryGetValue(source, out var existing))
         {
+            if (existing.NativeCaptureUnavailable) TryAdoptNativeAppearance(source, existing);
             if (!created && existing.Appearance is not null && !existing.RestorePending &&
                 _native.IsVisible(source) && !_native.IsMinimized(source) && !existing.HasNormalShow)
             {
                 existing.HasNormalShow = true;
                 // Explorer can finish its initial style setup after CREATE.
                 // Reapply once using the ORIGINAL snapshot, never recapture ours.
-                if (!ApplyTransparency(source, existing)) RestoreOwned(source, existing);
+                if (existing.Appearance.Native is null && !ApplyTransparency(source, existing)) RestoreOwned(source, existing);
                 if (main.HasValue && _native.IsValid(main.Value)) _native.Activate(main.Value);
             }
             return;
@@ -117,6 +119,9 @@ internal sealed class SourceWindowPresentation : IDisposable
                 if (visible) _native.Activate(main!.Value);
                 return; // Successful alpha suppression never minimizes.
             }
+            // A native snapshot owned by another controller, an expired timer,
+            // or an incomplete claim must never become a new alpha-zero baseline.
+            if (entry.NativeCaptureUnavailable) { _protected.TryAdd(source, 0); return; }
             RestoreAppearance(source, entry);
             if (visible && !_native.IsMinimized(source))
             {
@@ -137,15 +142,34 @@ internal sealed class SourceWindowPresentation : IDisposable
 
     private bool CaptureAndSuppress(WindowId window, Entry entry)
     {
+        var claim = TryAdoptNativeAppearance(window, entry);
+        if (claim == NativeSourceAppearanceClaim.Unavailable) return false;
+        if (claim == NativeSourceAppearanceClaim.Claimed) return true;
         if (!_native.TryGetExtendedStyle(window, out var style)) return false;
         var attributes = new LayeredWindowAttributes(0, 255, AlphaFlag);
         if ((style & Layered) != 0 && !_native.TryGetLayeredAttributes(window, out attributes)) return false;
         entry.Appearance = new Appearance(style, attributes);
         return ApplyTransparency(window, entry);
     }
+    private NativeSourceAppearanceClaim TryAdoptNativeAppearance(WindowId window, Entry entry)
+    {
+        var claim = _native.TryClaimNativeAppearance(window, out var snapshot);
+        entry.NativeCaptureUnavailable = claim == NativeSourceAppearanceClaim.Unavailable;
+        if (claim != NativeSourceAppearanceClaim.Claimed) return claim;
+        // Native already hid this frame. Never reapply alpha zero: its
+        // deadline could restore/remove ownership between our native calls.
+        entry.Appearance = new Appearance(snapshot.OriginalStyle, snapshot.Attributes, snapshot);
+        entry.Lifetime = _native.NativeAppearanceRemaining(snapshot);
+        entry.MinimizedAt = _clock.GetTimestamp();
+        if (!_native.OwnsNativeAppearance(window, snapshot))
+        { entry.NativeCaptureUnavailable = true; return NativeSourceAppearanceClaim.Unavailable; }
+        _protected.TryRemove(window, out _);
+        return NativeSourceAppearanceClaim.Claimed;
+    }
     private bool ApplyTransparency(WindowId window, Entry entry)
     {
         if (entry.Appearance is not { } original || !_native.IsValid(window) ||
+            !NativeOwnershipCurrent(window, original) ||
             !_native.TryGetExtendedStyle(window, out var current)) return false;
         if ((current & Layered) == 0 && !_native.TrySetExtendedStyle(window, current | Layered)) return false;
         // Alpha-zero idea adapted from ExplorerTabUtility Helpers/Helper.cs,
@@ -174,12 +198,20 @@ internal sealed class SourceWindowPresentation : IDisposable
         foreach (var (window, entry) in _seen.ToArray())
         {
             if (!_native.IsValid(window)) { _seen.Remove(window); _protected.TryRemove(window, out _); continue; }
+            if (entry.NativeCaptureUnavailable) TryAdoptNativeAppearance(window, entry);
+            if (entry.Appearance is { Native: not null } nativeAppearance && !NativeOwnershipCurrent(window, nativeAppearance))
+            {
+                // The native timer/death safeguard or a newer capture has taken
+                // over. Do not re-hide or restore through a stale HWND token.
+                entry.Appearance = null; entry.RestorePending = false;
+                _protected.TryAdd(window, 0);
+            }
             if (!entry.OwnsMinimize && entry.Appearance is null) continue;
             if (entry.RestorePending && SinceRestoreAttempt(entry) < RestoreRetryDelay) continue;
             var minimized = _native.IsMinimized(window);
             if (entry.OwnsMinimize || entry.HasNormalShow && Age(entry) >= InitialShowGrace)
                 entry.ObservedMinimized |= minimized;
-            if (entry.RestorePending || !validMain || window == main || Age(entry) >= PresentationTimeout)
+            if (entry.RestorePending || !validMain || window == main || Age(entry) >= entry.Lifetime)
                 RestoreOwned(window, entry);
             else if (entry.ObservedMinimized && Age(entry) >= InitialShowGrace && !minimized)
             {
@@ -198,6 +230,7 @@ internal sealed class SourceWindowPresentation : IDisposable
         {
             if (_disposed || !_seen.TryGetValue(source, out var entry)) return;
             if (!_native.IsValid(source)) { _seen.Remove(source); _protected.TryRemove(source, out _); return; }
+            if (entry.NativeCaptureUnavailable) TryAdoptNativeAppearance(source, entry);
             // Queued owns captured background work, not native disappearance.
             if (result is not (TransferResult.NotReady or TransferResult.Queued))
                 RestoreOwned(source, entry); // Even claimed Completed/Gone must unhide a still-live frame.
@@ -217,20 +250,46 @@ internal sealed class SourceWindowPresentation : IDisposable
     private void RestoreAppearance(WindowId window, Entry entry)
     {
         if (entry.Appearance is not { } original) return;
-        if (!_native.IsValid(window)) { entry.Appearance = null; entry.RestorePending = false; return; }
+        if (!_native.IsValid(window) || !NativeOwnershipCurrent(window, original))
+        { entry.Appearance = null; entry.RestorePending = false; return; }
+        if (!entry.RestorePending && original.Native is { } native && NativeSuppressionReplaced(window, original))
+        {
+            // A different owner changed the live appearance. Relinquish the
+            // native marker without overwriting their alpha or style settings.
+            if (_native.ReleaseNativeAppearance(window, native) || !_native.OwnsNativeAppearance(window, native))
+                entry.Appearance = null;
+            return;
+        }
         entry.RestorePending = true;
         entry.LastRestoreAttempt = _clock.GetTimestamp();
+        if (original.Native is { } restoring)
+        {
+            bool begun;
+            try { begun = _native.BeginNativeAppearanceRestore(window, restoring); }
+            catch { begun = false; }
+            if (!begun)
+            {
+                // Keep a current token for the bounded retry, but issue no
+                // appearance write until native acknowledges the restore state.
+                if (!NativeOwnershipCurrent(window, original))
+                { entry.Appearance = null; entry.RestorePending = false; }
+                return;
+            }
+        }
         for (var attempt = 0; attempt < 2; attempt++)
         {
             try
             {
-                if (!_native.IsValid(window)) { entry.Appearance = null; entry.RestorePending = false; return; }
+                if (!_native.IsValid(window) || !NativeOwnershipCurrent(window, original))
+                { entry.Appearance = null; entry.RestorePending = false; return; }
                 if (!_native.TryGetExtendedStyle(window, out var current)) continue;
                 var restored = (original.Style & Layered) != 0
                     ? ((current & Layered) != 0 || _native.TrySetExtendedStyle(window, current | Layered)) &&
                         _native.TrySetLayeredAttributes(window, original.Attributes)
                     : (current & Layered) == 0 || _native.TrySetExtendedStyle(window, current & ~Layered);
-                if (restored) { entry.Appearance = null; entry.RestorePending = false; return; }
+                if (restored && (original.Native is not { } token || _native.ReleaseNativeAppearance(window, token) ||
+                    !_native.OwnsNativeAppearance(window, token)))
+                { entry.Appearance = null; entry.RestorePending = false; return; }
             }
             catch { /* Keep the original token and try the bounded safety path. */ }
         }
@@ -239,10 +298,21 @@ internal sealed class SourceWindowPresentation : IDisposable
         // and retry exact restoration on the next native presentation pulse.
         try
         {
-            if (_native.IsValid(window) && _native.TryGetExtendedStyle(window, out var current))
+            if (_native.IsValid(window) && NativeOwnershipCurrent(window, original) && _native.TryGetExtendedStyle(window, out var current))
                 _native.TrySetExtendedStyle(window, current & ~Layered);
         }
         catch { }
+    }
+    private bool NativeOwnershipCurrent(WindowId window, Appearance appearance) =>
+        appearance.Native is not { } token || _native.OwnsNativeAppearance(window, token);
+    private bool NativeSuppressionReplaced(WindowId window, Appearance original)
+    {
+        if (!_native.TryGetExtendedStyle(window, out var current)) return false;
+        if ((current & Layered) == 0) return true;
+        if (!_native.TryGetLayeredAttributes(window, out var attributes)) return false;
+        var expected = new LayeredWindowAttributes(original.Attributes.ColorKey, 0,
+            (original.Style & Layered) != 0 ? original.Attributes.Flags | AlphaFlag : AlphaFlag);
+        return attributes != expected;
     }
     private void RestoreOwned(WindowId window, Entry entry)
     {
@@ -280,7 +350,7 @@ internal sealed class SourceWindowPresentation : IDisposable
                 _seen.Remove(key);
         }
     }
-    private sealed record Appearance(uint Style, LayeredWindowAttributes Attributes);
+    private sealed record Appearance(uint Style, LayeredWindowAttributes Attributes, NativeSourceAppearanceSnapshot? Native = null);
     private sealed record MainReference(WindowId Value);
     private sealed class Entry
     {
@@ -289,6 +359,8 @@ internal sealed class SourceWindowPresentation : IDisposable
         public bool ObservedMinimized { get; set; }
         public bool HasNormalShow { get; set; }
         public bool RestorePending { get; set; }
+        public bool NativeCaptureUnavailable { get; set; }
+        public TimeSpan Lifetime { get; set; } = PresentationTimeout;
         public long MinimizedAt { get; set; }
         public long LastRestoreAttempt { get; set; }
     }
@@ -306,6 +378,12 @@ internal interface ISourceWindowPresentationNative
     bool TrySetExtendedStyle(WindowId window, uint style);
     bool TryGetLayeredAttributes(WindowId window, out LayeredWindowAttributes attributes);
     bool TrySetLayeredAttributes(WindowId window, LayeredWindowAttributes attributes);
+    NativeSourceAppearanceClaim TryClaimNativeAppearance(WindowId window, out NativeSourceAppearanceSnapshot snapshot)
+    { snapshot = default; return NativeSourceAppearanceClaim.None; }
+    bool OwnsNativeAppearance(WindowId window, NativeSourceAppearanceSnapshot snapshot) => false;
+    bool BeginNativeAppearanceRestore(WindowId window, NativeSourceAppearanceSnapshot snapshot) => false;
+    bool ReleaseNativeAppearance(WindowId window, NativeSourceAppearanceSnapshot snapshot) => false;
+    TimeSpan NativeAppearanceRemaining(NativeSourceAppearanceSnapshot snapshot) => TimeSpan.FromSeconds(4);
     bool Minimize(WindowId window);
     void Restore(WindowId window);
     void Activate(WindowId window);
@@ -313,6 +391,7 @@ internal interface ISourceWindowPresentationNative
 
 internal sealed class SourceWindowPresentationNative : ISourceWindowPresentationNative
 {
+    private readonly NativeSourceAppearance nativeAppearance = new();
     private const int SwForceMinimize = 11;
     private const int SwRestore = 9;
     private const int SwShow = 5;
@@ -382,6 +461,11 @@ internal sealed class SourceWindowPresentationNative : ISourceWindowPresentation
     }
     public bool TrySetLayeredAttributes(WindowId window, LayeredWindowAttributes attributes) => IsValid(window) &&
         SetLayeredWindowAttributes(window.Handle, attributes.ColorKey, attributes.Alpha, attributes.Flags) && IsValid(window);
+    public NativeSourceAppearanceClaim TryClaimNativeAppearance(WindowId window, out NativeSourceAppearanceSnapshot snapshot) => nativeAppearance.TryClaim(window, out snapshot);
+    public bool OwnsNativeAppearance(WindowId window, NativeSourceAppearanceSnapshot snapshot) => nativeAppearance.Owns(window, snapshot);
+    public bool BeginNativeAppearanceRestore(WindowId window, NativeSourceAppearanceSnapshot snapshot) => nativeAppearance.BeginRestore(window, snapshot);
+    public bool ReleaseNativeAppearance(WindowId window, NativeSourceAppearanceSnapshot snapshot) => nativeAppearance.Release(window, snapshot);
+    public TimeSpan NativeAppearanceRemaining(NativeSourceAppearanceSnapshot snapshot) => nativeAppearance.Remaining(snapshot);
     public bool Minimize(WindowId window)
     {
         if (!IsValid(window)) return false;

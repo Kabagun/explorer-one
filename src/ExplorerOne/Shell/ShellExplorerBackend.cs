@@ -205,6 +205,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                 return TransferResult.NotReady;
             if (CanStartBackgroundTransfer(sourceWindow))
             {
+                TryStartEagerNativeFallback(sourceWindow, target, generation, cancellationToken);
                 WindowState captured;
                 var captureStartedAt = Stopwatch.GetTimestamp();
                 try { captured = CaptureRetainedWindow(sourceWindow, generation, allowLoadingFileView: true); }
@@ -465,6 +466,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         var actual = original.Tabs.Single();
         if (transfer.SourceState.Stamp != actual.Stamp)
         {
+            if (transfer.NativeFallback is not null && !_paths!.Equivalent(transfer.SourceState.Location, actual.Location))
+                throw new UnsupportedShellViewException(); // Never navigate a direct native copy after a source folder change.
             // Rebase only after our provisional copy was verified, and only
             // while its exact last managed contents remain untouched.
             if (!transfer.Verified || transfer.LastManagedState is null || transfer.SourceState.Handle != actual.Handle)
@@ -612,6 +615,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                     }
                     if (!transfer.NavigationIssued)
                     {
+                        if (transfer.NativeFallback is not null)
+                            throw new UnsupportedShellViewException();
                         // The default Home view need not be portable. Navigate
                         // only our newly associated native+registered tab.
                         if (transfer.RebaseFrom is not null)
@@ -1543,6 +1548,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         internal TabState? LastManagedState { get; set; }
         internal TabState? RebaseFrom { get; set; }
         internal NativeTabReservation? NativeReservation { get; set; }
+        internal NativeFallbackRequest? NativeFallback { get; set; }
+        internal bool SourceCapturePending { get; set; }
         internal bool AdoptedEarly { get; set; }
         internal bool EarlyDestinationValidated { get; set; }
         internal nint TargetTab { get; set; }
