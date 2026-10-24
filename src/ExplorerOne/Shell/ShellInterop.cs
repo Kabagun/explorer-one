@@ -174,6 +174,15 @@ internal sealed class ShellPathComparer : IDisposable
         if (StringComparer.Ordinal.Equals(first, second))
             return true;
 
+        // LocationURL and Folder.Self.Path usually name the identical file
+        // using URI and filesystem spellings. Parse would normalize them to
+        // this same exact string anyway; avoid two cross-process Shell parses
+        // for every repeated source/destination coherence check.
+        first = ShellLocation.NormalizeParsingName(first);
+        second = ShellLocation.NormalizeParsingName(second);
+        if (StringComparer.Ordinal.Equals(first, second))
+            return true;
+
         nint firstPidl = 0;
         nint secondPidl = 0;
         try

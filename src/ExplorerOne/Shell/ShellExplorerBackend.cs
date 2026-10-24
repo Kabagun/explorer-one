@@ -1023,7 +1023,10 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                     if (classification == true)
                         excluded.Add(window.Id);
                     else if (classification == false)
+                    {
                         classifiedTabs.Add(tab);
+                        RememberMainRouteAnchor(window.Id, tab, index, _generation);
+                    }
                     // Null remains unknown/included; an older duplicate COM
                     // row must not replace the newest associated tab's state.
                     DiagnosticLastControlPanelTabsClassified = classifiedTabs.Count;
