@@ -3,4 +3,6 @@
   <ItemGroup><ProjectReference Include="../../src/ExplorerOne.Core/ExplorerOne.Core.csproj" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/TransferSafety.cs" Link="TransferSafety.cs" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/ShellLocation.cs" Link="ShellLocation.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/SourceStability.cs" Link="SourceStability.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="../../src/ExplorerOne/SourceWindowPresentation.cs" Link="SourceWindowPresentation.cs" /></ItemGroup>
 </Project>

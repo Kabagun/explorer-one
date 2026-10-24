@@ -10,6 +10,22 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
     public WindowId? MainWindow { get; private set; }
     public bool IsBusy => Volatile.Read(ref _polling) != 0;
     public int PendingCount => Math.Max(0, _windows.Count - (MainWindow.HasValue ? 1 : 0));
+    public (WindowId Source, TransferResult Result)? LastTransfer { get; private set; }
+    public bool HasReadyPending => NextPendingDelay == TimeSpan.Zero;
+    public TimeSpan? NextPendingDelay
+    {
+        get
+        {
+            if (!MainWindow.HasValue) return null;
+            DateTimeOffset? earliest = null;
+            foreach (var (id, observed) in _windows)
+                if (id != MainWindow.Value && (!earliest.HasValue || observed.RetryAt < earliest.Value))
+                    earliest = observed.RetryAt;
+            if (!earliest.HasValue) return null;
+            var remaining = earliest.Value - _clock.GetUtcNow();
+            return remaining > TimeSpan.Zero ? remaining : TimeSpan.Zero;
+        }
+    }
     public string Status { get; private set; } = "Ожидание Проводника";
 
     public async Task PollAsync(CancellationToken cancellationToken = default)
@@ -17,6 +33,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
         if (Interlocked.CompareExchange(ref _polling, 1, 0) != 0) return;
         try
         {
+            LastTransfer = null;
             cancellationToken.ThrowIfCancellationRequested();
             // Do not discard a main window when COM has failed or is restarting.
             var snapshot = backend.EnumerateWindows();
@@ -32,6 +49,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                     observed.TabCount = window.TabCount;
                     observed.RetryAt = DateTimeOffset.MinValue;
                     observed.Failures = 0;
+                    observed.ReadinessFailures = 0;
                 }
             }
 
@@ -45,6 +63,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                 {
                     observed.RetryAt = DateTimeOffset.MinValue;
                     observed.Failures = 0;
+                    observed.ReadinessFailures = 0;
                 }
             }
             if (!MainWindow.HasValue)
@@ -74,6 +93,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                 // Paths and raw COM exceptions never enter UI or persistent logs.
                 result = TransferResult.Retry;
             }
+            LastTransfer = (source.Value, result);
             if (result is TransferResult.Completed or TransferResult.SourceGone)
             {
                 _windows.Remove(source.Value);
@@ -82,9 +102,19 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
             else
             {
                 var observed = _windows[source.Value];
-                observed.Failures = Math.Min(5, observed.Failures + 1);
-                var seconds = result == TransferResult.Unsafe ? 30 : Math.Min(30, 1 << observed.Failures);
-                observed.RetryAt = _clock.GetUtcNow().AddSeconds(seconds);
+                int milliseconds;
+                if (result == TransferResult.NotReady)
+                {
+                    observed.ReadinessFailures = Math.Min(3, observed.ReadinessFailures + 1);
+                    milliseconds = 100 << (observed.ReadinessFailures - 1);
+                }
+                else
+                {
+                    observed.ReadinessFailures = 0;
+                    observed.Failures = Math.Min(5, observed.Failures + 1);
+                    milliseconds = result == TransferResult.Unsafe ? 30_000 : Math.Min(4_000, 250 << (observed.Failures - 1));
+                }
+                observed.RetryAt = _clock.GetUtcNow().AddMilliseconds(milliseconds);
                 Status = "Окно сохранено; повтор позже";
             }
         }
@@ -96,6 +126,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
         public long Sequence { get; } = sequence;
         public int TabCount { get; set; } = tabCount;
         public int Failures { get; set; }
+        public int ReadinessFailures { get; set; }
         public DateTimeOffset RetryAt { get; set; }
     }
 }
