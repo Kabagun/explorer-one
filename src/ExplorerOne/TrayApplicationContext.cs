@@ -38,7 +38,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private bool _wakeupMonitorInitialized;
     private bool _pollRequested;
     private bool _autoStartEnabled;
-    private bool _shuttingDown;
+    private volatile bool _shuttingDown;
+    private int _reportedBackgroundFailures;
 
     public TrayApplicationContext()
     {
@@ -102,9 +103,15 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (_shuttingDown)
             return;
 
-        _presentation?.OnShown(source, _coordinator?.MainWindow);
-        if (_activePoll is { IsCompleted: false })
-            SchedulePresentationExpiry();
+        // Called on the native-only watcher thread; presentation owns its
+        // synchronized main-window snapshot and makes no COM/UI-timer calls.
+        _presentation?.OnShown(source);
+    }
+
+    private void OnPresentationPulse()
+    {
+        if (!_shuttingDown)
+            _presentation?.ObserveCurrentMain();
     }
 
     private void SchedulePresentationExpiry()
@@ -167,7 +174,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         ShellExplorerBackend? backend = null;
         try
         {
-            backend = new ShellExplorerBackend();
+            backend = new ShellExplorerBackend(closeSourceEarly: true);
+            backend.BackgroundTransferChanged += OnExplorerWindowLifecycle;
             _coordinator = new WindowCoordinator(backend);
             _backend = backend;
             return true;
@@ -197,7 +205,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 _presentation ??= new SourceWindowPresentation();
                 _wakeupMonitorInitialized = true;
-                _wakeupMonitor = new ExplorerWakeupMonitor(OnExplorerWindowLifecycle, OnExplorerWindowShown);
+                _wakeupMonitor = new ExplorerWakeupMonitor(OnExplorerWindowLifecycle, OnExplorerWindowShown, OnPresentationPulse);
             }
             if (_coordinator is null && !TryInitializeBackend())
                 return;
@@ -216,6 +224,7 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     return;
 
                 _statusItem.Text = coordinator.Status;
+                ReportBackgroundFailures();
                 if (!coordinator.HasReadyPending && !_pollRequested)
                     break;
 
@@ -262,6 +271,21 @@ internal sealed class TrayApplicationContext : ApplicationContext
         }
     }
 
+    private void ReportBackgroundFailures()
+    {
+        var failures = _backend?.FailedTransferCount ?? 0;
+        if (failures <= _reportedBackgroundFailures || _shuttingDown)
+            return;
+        _reportedBackgroundFailures = failures;
+        _statusItem.Text = "Не удалось открыть вкладку.";
+        try
+        {
+            _notifyIcon.ShowBalloonTip(5000, "ExplorerOne",
+                "Не удалось открыть папку во вкладке. Повтори открытие папки.", ToolTipIcon.Warning);
+        }
+        catch { }
+    }
+
     private void OnExitClick(object? sender, EventArgs e) => _ = ShutdownSafelyAsync();
 
     private async Task ShutdownSafelyAsync()
@@ -292,6 +316,14 @@ internal sealed class TrayApplicationContext : ApplicationContext
                     await _activePoll;
             }
             catch { }
+            try
+            {
+                // Accepted early-close copies outlive the routing request.
+                // Finish their bounded work before releasing shared COM objects.
+                if (_backend is not null)
+                    await _backend.DrainBackgroundTransfersAsync();
+            }
+            catch { }
         }
         finally
         {
@@ -311,6 +343,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         try { _presentation?.Dispose(); } catch { }
         _presentation = null;
         try { _lifetime.Dispose(); } catch { }
+        if (_backend is not null)
+            _backend.BackgroundTransferChanged -= OnExplorerWindowLifecycle;
         try { _backend?.Dispose(); } catch { }
         _backend = null;
         _coordinator = null;

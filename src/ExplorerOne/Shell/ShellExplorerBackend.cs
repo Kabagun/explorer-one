@@ -13,10 +13,10 @@ using ExplorerOne.Core;
 namespace ExplorerOne.Shell;
 
 /// <summary>
-/// Accesses Explorer on the owning WinForms STA. A failed or uncertain copy never
-/// closes its source. This class must be constructed and used inside the UI pump.
+/// Accesses Explorer on the owning WinForms STA. The default policy verifies
+/// before closing; explicitly selected early-close mode owns background copies.
 /// </summary>
-public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
+public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPreparationBackend, IExplorerBackgroundBackend, IDisposable
 {
     private static readonly Guid ShellWindowsClass = new("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
     private static readonly Guid ShellApplicationClass = new("13709620-C279-11CE-A49E-444553540000");
@@ -26,6 +26,7 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
     private const int MaximumRetainedTransfers = 256;
 
     private readonly int _ownerThread = Environment.CurrentManagedThreadId;
+    private readonly bool _closeSourceEarly;
     private readonly List<PartialTransfer> _partialTransfers = [];
     private object? _shellWindows;
     private ShellPathComparer? _paths;
@@ -43,19 +44,43 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
     internal long DiagnosticSourceStabilityMilliseconds { get; private set; }
     internal long DiagnosticRegistryMilliseconds { get; private set; }
     internal int DiagnosticRegistryReadCount { get; private set; }
+    internal int DiagnosticRegistryBrowsersVisited { get; private set; }
+    internal int DiagnosticTargetBrowsersVisited { get; private set; }
+    internal int DiagnosticPreviousRegistryBrowsersVisited { get; private set; }
+    internal int DiagnosticPreviousTargetBrowsersVisited { get; private set; }
     internal long DiagnosticTabReadyMilliseconds { get; private set; }
     internal long DiagnosticNavigateCallMilliseconds { get; private set; }
     internal long DiagnosticNavigationReadyMilliseconds { get; private set; }
     internal int DiagnosticDestinationPollCount { get; private set; }
+    internal long DiagnosticActivationMilliseconds { get; private set; }
+    internal long DiagnosticInitialCaptureMilliseconds { get; private set; }
+    internal long DiagnosticFinalVerifyMilliseconds { get; private set; }
+    internal long DiagnosticCloseCallMilliseconds { get; private set; }
+    internal long DiagnosticCloseWaitMilliseconds { get; private set; }
+    internal long DiagnosticPreviousTransferMilliseconds { get; private set; }
+    internal long DiagnosticPreviousRegistryMilliseconds { get; private set; }
+    internal long DiagnosticPreviousInitialCaptureMilliseconds { get; private set; }
+    internal long DiagnosticPreviousSourceStabilityMilliseconds { get; private set; }
+    internal long DiagnosticPreviousPreparationMilliseconds { get; private set; }
+    internal long DiagnosticPreviousAllocationMilliseconds { get; private set; }
+    internal long DiagnosticPreviousTabReadyMilliseconds { get; private set; }
+    internal long DiagnosticPreviousNavigationReadyMilliseconds { get; private set; }
+    internal long DiagnosticPreviousFinalVerifyMilliseconds { get; private set; }
+    internal long DiagnosticPreviousCloseCallMilliseconds { get; private set; }
+    internal long DiagnosticPreviousCloseWaitMilliseconds { get; private set; }
+    internal long DiagnosticLastEnumerationMilliseconds { get; private set; }
+    internal long DiagnosticLastControlPanelClassificationMilliseconds { get; private set; }
 
-    public ShellExplorerBackend()
+    public ShellExplorerBackend(bool closeSourceEarly = false)
     {
         AssertContext();
+        _closeSourceEarly = closeSourceEarly;
     }
 
     public IReadOnlyList<ExplorerWindow> EnumerateWindows()
     {
         AssertContext();
+        var startedAt = Stopwatch.GetTimestamp();
         try
         {
             // Discovery is a complete NATIVE inventory. A different window
@@ -73,11 +98,29 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             // an incomplete native inventory as the entire set of windows.
             throw new ShellSnapshotException();
         }
+        finally { DiagnosticLastEnumerationMilliseconds = ElapsedMilliseconds(startedAt); }
     }
 
     public async Task<TransferResult> TransferAsync(WindowId source, WindowId target, CancellationToken cancellationToken)
     {
         AssertContext();
+        // An explicit coordinator plan is one-shot, even for a rejected call.
+        // Direct backend calls never discover or prepare unrelated windows.
+        var preparationCandidate = TakePreparationCandidate(source, target);
+        if (_closeSourceEarly) preparationCandidate = null; // Fast jobs never speculate on another source.
+        DiagnosticPreviousTransferMilliseconds = DiagnosticTransferMilliseconds;
+        DiagnosticPreviousRegistryMilliseconds = DiagnosticRegistryMilliseconds;
+        DiagnosticPreviousRegistryBrowsersVisited = DiagnosticRegistryBrowsersVisited;
+        DiagnosticPreviousTargetBrowsersVisited = DiagnosticTargetBrowsersVisited;
+        DiagnosticPreviousInitialCaptureMilliseconds = DiagnosticInitialCaptureMilliseconds;
+        DiagnosticPreviousSourceStabilityMilliseconds = DiagnosticSourceStabilityMilliseconds;
+        DiagnosticPreviousPreparationMilliseconds = DiagnosticPreparationMilliseconds;
+        DiagnosticPreviousAllocationMilliseconds = DiagnosticAllocationMilliseconds;
+        DiagnosticPreviousTabReadyMilliseconds = DiagnosticTabReadyMilliseconds;
+        DiagnosticPreviousNavigationReadyMilliseconds = DiagnosticNavigationReadyMilliseconds;
+        DiagnosticPreviousFinalVerifyMilliseconds = DiagnosticFinalVerifyMilliseconds;
+        DiagnosticPreviousCloseCallMilliseconds = DiagnosticCloseCallMilliseconds;
+        DiagnosticPreviousCloseWaitMilliseconds = DiagnosticCloseWaitMilliseconds;
         DiagnosticPhase = "transfer-start";
         DiagnosticFailureType = null;
         DiagnosticFailureHResult = 0;
@@ -85,12 +128,22 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         DiagnosticSourceStabilityMilliseconds = 0;
         DiagnosticRegistryMilliseconds = 0;
         DiagnosticRegistryReadCount = 0;
+        DiagnosticRegistryBrowsersVisited = 0;
+        DiagnosticTargetBrowsersVisited = 0;
         DiagnosticTabReadyMilliseconds = 0;
         DiagnosticNavigateCallMilliseconds = 0;
         DiagnosticNavigationReadyMilliseconds = 0;
         DiagnosticDestinationPollCount = 0;
+        DiagnosticActivationMilliseconds = 0;
+        DiagnosticInitialCaptureMilliseconds = 0;
+        DiagnosticFinalVerifyMilliseconds = 0;
+        DiagnosticCloseCallMilliseconds = 0;
+        DiagnosticCloseWaitMilliseconds = 0;
+        ResetPreparationDiagnostics();
         if (_transferring)
             return TransferResult.Retry;
+        if (_backgroundJobs.ContainsKey(source))
+            return TransferResult.NotReady; // This source is already exclusively owned by its background job.
         if (source == target || source.Handle == target.Handle || !IsExplorerWindow(target))
             return TransferResult.Unsafe;
         if (!IsExplorerWindow(source))
@@ -103,20 +156,71 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         {
             cancellationToken.ThrowIfCancellationRequested();
             PruneVanishedTransfers();
-            // Retain a complete snapshot of BOTH endpoints for this transfer.
-            // Unrelated windows may still be registering their COM views.
-            using var initial = ReadScopedRegisteredTabs(source, target);
+            if (_closeSourceEarly && (!_acceptBackgroundTransfers || _backgroundJobs.Count >= MaximumBackgroundTransfers) &&
+                ReadNativeTabs(source).Length == 1)
+                return TransferResult.NotReady;
+            // Only the source's complete initial view is consumed here. The
+            // destination is identified/bound natively during preparation; its
+            // ALL-tab COM/native snapshot remains mandatory at the close gate.
+            using var initial = ReadScopedRegisteredTabs(source);
             var sourceWindow = initial.FindWindow(source);
             var generation = _generation;
             var observationStartedAt = Environment.TickCount64;
-            var original = await CaptureStableSourceAsync(sourceWindow, generation, observationStartedAt, cancellationToken);
+            if (_closeSourceEarly && sourceWindow.Tabs.Count == 1 &&
+                (!_acceptBackgroundTransfers || _backgroundJobs.Count >= MaximumBackgroundTransfers))
+                return TransferResult.NotReady;
+            if (CanStartBackgroundTransfer(sourceWindow))
+            {
+                WindowState captured;
+                var captureStartedAt = Stopwatch.GetTimestamp();
+                try { captured = CaptureRetainedWindow(sourceWindow, generation); }
+                finally { DiagnosticInitialCaptureMilliseconds += ElapsedMilliseconds(captureStartedAt); }
+                var queued = await TryQueueBackgroundTransferAsync(captured, sourceWindow.Tabs[0], target, generation, cancellationToken);
+                if (queued.HasValue)
+                    return queued.Value;
+            }
+            var transfers = new List<PartialTransfer>();
+            WindowState? original;
+            (WindowState State, PartialTransfer Transfer)? prepared = null;
+            if (sourceWindow.Tabs.Count == 1)
+                prepared = await TryReusePreparedSourceAsync(sourceWindow, target, generation, cancellationToken);
+            if (prepared.HasValue)
+            {
+                copyingStarted = true;
+                original = prepared.Value.State;
+                transfers.Add(prepared.Value.Transfer);
+            }
+            else if (sourceWindow.Tabs.Count == 1)
+            {
+                // Prepare our destination while the independently sampled
+                // source satisfies the unchanged /select quiet period. Only
+                // the stable snapshot below may become the close baseline.
+                WindowState provisional;
+                long provisionalObservedAt;
+                var initialCaptureStartedAt = Stopwatch.GetTimestamp();
+                try
+                {
+                    provisional = CaptureRetainedWindow(sourceWindow, generation);
+                    provisionalObservedAt = Environment.TickCount64;
+                }
+                finally { DiagnosticInitialCaptureMilliseconds += ElapsedMilliseconds(initialCaptureStartedAt); }
+                var transfer = GetOrCreateTransfer(source, target, provisional.Tabs[0]);
+                copyingStarted = true;
+                original = await PrepareWithCandidateAsync(sourceWindow, provisional, provisionalObservedAt,
+                    transfer, generation, observationStartedAt, preparationCandidate, cancellationToken);
+                if (original is not null)
+                    transfers.Add(transfer);
+            }
+            else
+            {
+                original = await CaptureStableSourceAsync(sourceWindow, generation, observationStartedAt, cancellationToken);
+            }
             if (original is null)
             {
                 DiagnosticPhase = "source-not-settled";
                 return IsExplorerWindow(source) ? TransferResult.NotReady : TransferResult.SourceGone;
             }
-            var transfers = new List<PartialTransfer>();
-            for (var index = 0; index < original.Tabs.Length; index++)
+            for (var index = transfers.Count; index < original.Tabs.Length; index++)
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 var current = CaptureRetainedWindow(sourceWindow, generation);
@@ -138,19 +242,9 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
                 }
                 var tab = original.Tabs[index];
 
-                var transfer = _partialTransfers.FirstOrDefault(candidate =>
-                    candidate.Source == source && candidate.SourceState.Stamp == tab.Stamp);
-                if (transfer is not null && transfer.Target != target)
-                    return TransferResult.Unsafe;
-                if (transfer is null)
-                {
-                    // Keep unsuccessful requests too: a timed-out Ctrl+T may be
-                    // delivered later, so retrying must never send another one.
-                    if (_partialTransfers.Count >= MaximumRetainedTransfers)
-                        return TransferResult.Unsafe;
-                    transfer = new PartialTransfer(source, target, tab);
-                    _partialTransfers.Add(transfer);
-                }
+                var transfer = GetOrCreateTransfer(source, target, tab);
+                if (transfer.SourceState.Stamp != tab.Stamp)
+                    return TransferResult.Unsafe; // Multi-tab transfers retain their serial policy.
 
                 copyingStarted = true;
                 if (!await EnsureDestinationAsync(transfer, generation, cancellationToken))
@@ -170,40 +264,61 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             // Re-read both endpoint windows in a fresh complete scoped COM/
             // native snapshot. All source AND target native tabs are covered;
             // no source mutation precedes this gate.
-            using (var final = ReadScopedRegisteredTabs(source, target))
+            var finalVerifyStartedAt = Stopwatch.GetTimestamp();
+            try
             {
-                var targetWindow = final.FindWindow(target);
-                var destinations = new List<VerifiedTabTransfer>();
-                foreach (var transfer in transfers)
+                using (var final = ReadScopedRegisteredTabs(source, target))
                 {
-                    var reference = targetWindow.Tabs.SingleOrDefault(tab => tab.Handle == transfer.TargetTab)
-                        ?? throw new ShellSnapshotException();
-                    var copied = CaptureTab(reference);
-                    if (!SameTabContents(transfer.SourceState, copied))
-                        return TransferResult.Unsafe;
-                    destinations.Add(new VerifiedTabTransfer(transfer.SourceState.Handle, copied.Stamp));
-                }
+                    var targetWindow = final.FindWindow(target);
+                    var destinations = new List<VerifiedTabTransfer>();
+                    foreach (var transfer in transfers)
+                    {
+                        var reference = targetWindow.Tabs.SingleOrDefault(tab => tab.Handle == transfer.TargetTab)
+                            ?? throw new ShellSnapshotException();
+                        var copied = CaptureTab(reference);
+                        if (!SameTabContents(transfer.SourceState, copied))
+                            return TransferResult.Unsafe;
+                        destinations.Add(new VerifiedTabTransfer(transfer.SourceState.Handle, copied.Stamp));
+                    }
 
-                var current = CaptureWindow(final.FindWindow(source));
-                if (!TransferSafety.CanCloseSource(original.Stamps, current.Stamps, destinations) ||
-                    generation != _generation || !IsExplorerWindow(source) || !IsExplorerWindow(target) ||
-                    !NativeTabsMatch(source, original.Tabs.Select(tab => tab.Handle)) ||
-                    !NativeTabsMatch(target, targetWindow.Tabs.Select(tab => tab.Handle)))
-                {
-                    DiagnosticPhase = "close-guard-rejected";
-                    return TransferResult.Retry;
-                }
+                    var current = CaptureWindow(final.FindWindow(source));
+                    if (!TransferSafety.CanCloseSource(original.Stamps, current.Stamps, destinations) ||
+                        generation != _generation || !IsExplorerWindow(source) || !IsExplorerWindow(target) ||
+                        !NativeTabsMatch(source, original.Tabs.Select(tab => tab.Handle)) ||
+                        !NativeTabsMatch(target, targetWindow.Tabs.Select(tab => tab.Handle)))
+                    {
+                        DiagnosticPhase = "close-guard-rejected";
+                        return TransferResult.Retry;
+                    }
 
-                cancellationToken.ThrowIfCancellationRequested();
-                // Quit() can close a different scope on tabbed Explorer. Send a
-                // bounded close only to this exact HWND+PID after verification.
-                _ = ShellNative.SendMessageTimeout(source.Handle, ShellNative.WmClose, 0, 0,
-                    ShellNative.AbortIfHung | ShellNative.ErrorOnExit, 1000, out _);
+                    cancellationToken.ThrowIfCancellationRequested();
+                    // Quit() can close a different scope on tabbed Explorer. Send a
+                    // bounded close only to this exact HWND+PID after verification.
+                    var closeCallStartedAt = Stopwatch.GetTimestamp();
+                    try
+                    {
+                        _ = ShellNative.SendMessageTimeout(source.Handle, ShellNative.WmClose, 0, 0,
+                            ShellNative.AbortIfHung | ShellNative.ErrorOnExit, 1000, out _);
+                    }
+                    finally { DiagnosticCloseCallMilliseconds += ElapsedMilliseconds(closeCallStartedAt); }
+                }
+            }
+            finally
+            {
+                // Account for snapshot capture/disposal and the complete gate,
+                // with the separately measured native close call excluded.
+                DiagnosticFinalVerifyMilliseconds += Math.Max(0,
+                    ElapsedMilliseconds(finalVerifyStartedAt) - DiagnosticCloseCallMilliseconds);
             }
 
             var deadline = Environment.TickCount64 + 1500;
-            while (IsExplorerWindow(source) && Environment.TickCount64 < deadline)
-                await Task.Delay(PollMilliseconds, cancellationToken);
+            var closeWaitStartedAt = Stopwatch.GetTimestamp();
+            try
+            {
+                while (IsExplorerWindow(source) && Environment.TickCount64 < deadline)
+                    await Task.Delay(10, cancellationToken); // Cheap native close observation only.
+            }
+            finally { DiagnosticCloseWaitMilliseconds += ElapsedMilliseconds(closeWaitStartedAt); }
             if (IsExplorerWindow(source))
             {
                 DiagnosticPhase = "source-close-timeout";
@@ -222,6 +337,11 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             return TransferResult.Retry;
         }
         catch (UnsupportedShellViewException exception)
+        {
+            RecordDiagnosticFailure(exception);
+            return TransferResult.Unsafe;
+        }
+        catch (NativeAllocationAmbiguityException exception)
         {
             RecordDiagnosticFailure(exception);
             return TransferResult.Unsafe;
@@ -246,22 +366,131 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         }
     }
 
+    private PartialTransfer GetOrCreateTransfer(WindowId source, WindowId target, TabState tab)
+    {
+        // An unresolved request belongs to the source native tab even if a
+        // late /select update changes its contents. Never issue another Ctrl+T
+        // merely because the selection/location part of its stamp changed.
+        var retained = _partialTransfers.Where(candidate => candidate.Source == source &&
+            candidate.SourceState.Handle == tab.Handle).ToArray();
+        if (retained.Length > 1 || (retained.Length == 1 && retained[0].Target != target))
+            throw new UnsupportedShellViewException();
+        if (retained.Length == 1)
+            return retained[0];
+        if (_partialTransfers.Count >= MaximumRetainedTransfers)
+            throw new UnsupportedShellViewException();
+        var transfer = new PartialTransfer(source, target, tab);
+        _partialTransfers.Add(transfer);
+        return transfer;
+    }
+
+    private async Task<WindowState?> PrepareSingleTabAsync(RegisteredWindow source, WindowState provisional,
+        long provisionalObservedAt, PartialTransfer transfer, int generation, long observationStartedAt,
+        CancellationToken cancellationToken)
+    {
+        using var pending = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var destination = EnsureDestinationAsync(transfer, generation, pending.Token);
+        var stable = CaptureStableSourceAsync(source, generation, observationStartedAt, pending.Token,
+            provisional, provisionalObservedAt);
+        WindowState? original;
+        try
+        {
+            // Observe either failure immediately, and drain both tasks before
+            // returning or releasing their retained COM references.
+            if (await Task.WhenAny(destination, stable) == destination)
+            {
+                if (!await destination)
+                    throw new ShellSnapshotException();
+                original = await stable;
+            }
+            else
+            {
+                original = await stable;
+                if (original is null)
+                    return null;
+                if (!await destination)
+                    throw new ShellSnapshotException();
+            }
+        }
+        finally
+        {
+            pending.Cancel();
+            try { await Task.WhenAll(destination, stable); }
+            catch { /* The primary result/exception above owns classification. */ }
+        }
+        if (original is null)
+            return null;
+        if (generation != _generation || !SameWindowState(original, CaptureRetainedWindow(source, generation)))
+            throw new ShellSnapshotException(); // A change AFTER stability is never a new close baseline.
+        var actual = original.Tabs.Single();
+        if (transfer.SourceState.Stamp != actual.Stamp)
+        {
+            // Rebase only after our provisional copy was verified, and only
+            // while its exact last managed contents remain untouched.
+            if (!transfer.Verified || transfer.LastManagedState is null || transfer.SourceState.Handle != actual.Handle)
+                throw new UnsupportedShellViewException();
+            using var reference = FindRegisteredTab(transfer.Target, transfer.TargetTab, generation)
+                ?? throw new ShellSnapshotException();
+            ValidateReference(reference, transfer.Target);
+            var current = CaptureTab(reference);
+            if (current.Stamp != transfer.LastManagedState.Stamp)
+                throw new UnsupportedShellViewException();
+            transfer.RebaseFrom = current;
+            transfer.NavigationIssued = _paths!.Equivalent(transfer.SourceState.Location, actual.Location);
+            transfer.SourceState = actual;
+            transfer.Verified = false;
+            if (!await EnsureDestinationAsync(transfer, generation, cancellationToken))
+                throw new ShellSnapshotException();
+        }
+        return original;
+    }
+
     private async Task<WindowState?> CaptureStableSourceAsync(
-        RegisteredWindow source, int generation, long observationStartedAt, CancellationToken cancellationToken)
+        RegisteredWindow source, int generation, long observationStartedAt, CancellationToken cancellationToken,
+        WindowState? firstSample = null, long firstSampleObservedAt = 0)
     {
         var startedAt = Stopwatch.GetTimestamp();
         var stability = new SourceStability(observationStartedAt);
         try
         {
+            if (firstSample is not null)
+            {
+                if (firstSample.Id != source.Id)
+                    throw new ShellSnapshotException();
+                // The provisional capture already read the live Document and
+                // selection twice. Count that strict observation at the actual
+                // capture-finished time, then take later fresh temporal samples.
+                stability.Observe(firstSample.Stamps, firstSample.Tabs.Any(tab => tab.Selection.Length == 0),
+                    firstSampleObservedAt);
+                if (stability.IsExpired(Environment.TickCount64))
+                    return null;
+                DiagnosticPhase = "source-stabilizing";
+                await Task.Delay(SourceStability.SampleIntervalMilliseconds, cancellationToken);
+            }
             while (!stability.IsExpired(Environment.TickCount64))
             {
                 cancellationToken.ThrowIfCancellationRequested();
                 if (!IsExplorerWindow(source.Id))
                     return null;
 
-                // A busy or incomplete source asks for a cheap retry; no
-                // destination request has been made at this point.
-                var current = CaptureRetainedWindow(source, generation);
+                WindowState current;
+                try
+                {
+                    current = CaptureRetainedWindow(source, generation);
+                }
+                catch (ShellSnapshotException)
+                {
+                    // Busy views may settle while our provisional destination
+                    // loads. Identity, tab-set or shell-generation changes are
+                    // never treated as a transient source sample.
+                    RefreshShell();
+                    if (generation != _generation || !NativeTabsMatch(source.Id, source.Tabs.Select(tab => tab.Handle)))
+                        throw;
+                    stability.Observe([], true, Environment.TickCount64);
+                    DiagnosticPhase = "source-stabilizing";
+                    await Task.Delay(SourceStability.SampleIntervalMilliseconds, cancellationToken);
+                    continue;
+                }
                 if (stability.Observe(current.Stamps, current.Tabs.Any(tab => tab.Selection.Length == 0), Environment.TickCount64))
                     return current;
 
@@ -289,29 +518,19 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
 
     private async Task<bool> EnsureDestinationAsync(PartialTransfer transfer, int generation, CancellationToken cancellationToken)
     {
-        RefreshShell();
+        RefreshTransferShell(transfer, generation);
         if (generation != _generation)
             throw new ShellSnapshotException();
         if (!IsExplorerWindow(transfer.Target))
             throw new ShellSnapshotException();
 
-        if (!transfer.NewTabRequested)
-        {
-            transfer.TargetBefore = ReadNativeTabs(transfer.Target).ToHashSet();
-            var active = ShellNative.FindWindowEx(transfer.Target.Handle, 0, "ShellTabWindowClass", null);
-            if (!transfer.TargetBefore.Contains(active))
-                throw new ShellSnapshotException();
-
-            transfer.NewTabRequested = true;
-            DiagnosticPhase = "request-new-tab";
-            ActivateTarget(transfer.Target);
-            if (!ShellNative.PostMessage(active, ShellNative.WmCommand, ShellNative.NewTabCommand, 0))
-                throw new ShellSnapshotException();
-        }
-
+        var tabRequestedAt = Stopwatch.GetTimestamp();
+        if (!await EnsureNativeTabAsync(transfer, generation, cancellationToken))
+            return false;
+        if (transfer.BackgroundOwned)
+            await Task.Yield(); // Never enter destination COM before the caller posts its close request.
         var deadline = Environment.TickCount64 + DestinationTimeoutMilliseconds;
         var selectionAppliedThisAttempt = false;
-        var tabRequestedAt = Stopwatch.GetTimestamp();
         long? navigationStartedAt = null;
         RegisteredTab? reference = null;
         try
@@ -320,28 +539,12 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             {
                 DiagnosticDestinationPollCount++;
                 cancellationToken.ThrowIfCancellationRequested();
-                RefreshShell();
-                if (generation != _generation || !IsExplorerWindow(transfer.Source) || !IsExplorerWindow(transfer.Target))
+                RefreshTransferShell(transfer, generation);
+                if (generation != _generation || (!transfer.BackgroundOwned && !IsExplorerWindow(transfer.Source)) || !IsExplorerWindow(transfer.Target))
                     throw new ShellSnapshotException();
 
                 try
                 {
-                    if (transfer.TargetTab == 0)
-                    {
-                        DiagnosticPhase = "wait-native-tab";
-                        var added = ReadNativeTabs(transfer.Target).Where(tab => !transfer.TargetBefore.Contains(tab)).ToArray();
-                        if (added.Length > 1)
-                            throw new UnsupportedShellViewException();
-                        if (added.Length == 0)
-                        {
-                            await Task.Delay(PollMilliseconds, cancellationToken);
-                            continue;
-                        }
-                        // Retain the exact handle even before COM registration;
-                        // retrying this request must not send another Ctrl+T.
-                        transfer.TargetTab = added[0];
-                    }
-
                     if (!NativeTabBelongsTo(transfer.Target, transfer.TargetTab))
                         throw new UnsupportedShellViewException();
                     if (reference is null)
@@ -360,6 +563,12 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
                     {
                         // The default Home view need not be portable. Navigate
                         // only our newly associated native+registered tab.
+                        if (transfer.RebaseFrom is not null)
+                        {
+                            if (CaptureTab(reference).Stamp != transfer.RebaseFrom.Stamp)
+                                throw new UnsupportedShellViewException();
+                            transfer.RebaseFrom = null;
+                        }
                         transfer.NavigationIssued = true;
                         ActivateTarget(transfer.Target);
                         navigationStartedAt = Stopwatch.GetTimestamp();
@@ -381,6 +590,8 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
                         if (navigationStartedAt.HasValue)
                             DiagnosticNavigationReadyMilliseconds += ElapsedMilliseconds(navigationStartedAt.Value);
                         transfer.Verified = true;
+                        transfer.LastManagedState = current;
+                        transfer.RebaseFrom = null;
                         return true;
                     }
                     if (transfer.Verified)
@@ -389,18 +600,27 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
                     var sameLocation = _paths!.Equivalent(transfer.SourceState.Location, current.Location);
                     if (sameLocation && !selectionAppliedThisAttempt)
                     {
-                        if (!current.Selection.All(selected => transfer.SourceState.Selection.Any(expected =>
-                            _paths.Equivalent(expected.Identity, selected.Identity))))
+                        if (transfer.RebaseFrom is not null ? current.Stamp != transfer.RebaseFrom.Stamp :
+                            !current.Selection.All(selected => transfer.SourceState.Selection.Any(expected =>
+                                _paths.Equivalent(expected.Identity, selected.Identity))))
                             throw new UnsupportedShellViewException();
                         selectionAppliedThisAttempt = true;
                         DiagnosticPhase = "apply-selection";
                         ValidateReference(reference, transfer.Target);
+                        if (transfer.RebaseFrom is not null)
+                        {
+                            if (CaptureTab(reference).Stamp != transfer.RebaseFrom.Stamp)
+                                throw new UnsupportedShellViewException();
+                            transfer.RebaseFrom = null;
+                        }
                         ApplySelection(reference.Browser, transfer.SourceState.Selection);
-                        if (SameTabContents(transfer.SourceState, CaptureTab(reference)))
+                        var selected = CaptureTab(reference);
+                        if (SameTabContents(transfer.SourceState, selected))
                         {
                             if (navigationStartedAt.HasValue)
                                 DiagnosticNavigationReadyMilliseconds += ElapsedMilliseconds(navigationStartedAt.Value);
                             transfer.Verified = true;
+                            transfer.LastManagedState = selected;
                             return true;
                         }
                     }
@@ -435,12 +655,15 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             throw new ShellSnapshotException();
         dynamic shellWindows = _shellWindows!;
         int count = shellWindows.Count;
+        // New tab registrations are normally appended. Keep the exact native
+        // association checks below while avoiding older rows when it is last.
         for (var index = count - 1; index >= 0; index--)
         {
             object? browser = null;
             IShellBrowser? shellBrowser = null;
             try
             {
+                DiagnosticTargetBrowsersVisited++;
                 browser = shellWindows.Item(index);
                 if (browser is null)
                     continue;
@@ -508,13 +731,18 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         return process == window.ProcessId;
     }
 
-    private static void ActivateTarget(WindowId target)
+    private void ActivateTarget(WindowId target)
     {
-        if (!IsExplorerWindow(target))
-            return;
-        if (ShellNative.IsIconic(target.Handle))
-            _ = ShellNative.ShowWindowAsync(target.Handle, 9); // SW_RESTORE.
-        _ = ShellNative.SetForegroundWindow(target.Handle);
+        var startedAt = Stopwatch.GetTimestamp();
+        try
+        {
+            if (!IsExplorerWindow(target))
+                return;
+            if (ShellNative.IsIconic(target.Handle))
+                _ = ShellNative.ShowWindowAsync(target.Handle, 9); // SW_RESTORE.
+            _ = ShellNative.SetForegroundWindow(target.Handle);
+        }
+        finally { DiagnosticActivationMilliseconds += ElapsedMilliseconds(startedAt); }
     }
 
     private WindowState CaptureWindow(RegisteredWindow window)
@@ -673,6 +901,13 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
 
     private HashSet<WindowId> FindKnownControlPanelWindows(IReadOnlyList<NativeWindow> native)
     {
+        var startedAt = Stopwatch.GetTimestamp();
+        try { return FindKnownControlPanelWindowsCore(native); }
+        finally { DiagnosticLastControlPanelClassificationMilliseconds = ElapsedMilliseconds(startedAt); }
+    }
+
+    private HashSet<WindowId> FindKnownControlPanelWindowsCore(IReadOnlyList<NativeWindow> native)
+    {
         var excluded = new HashSet<WindowId>();
         if (native.Count == 0)
             return excluded;
@@ -738,6 +973,8 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             return true;
         if (!string.IsNullOrEmpty(url))
             return false; // Ordinary file tabs need no view capture.
+        if ((bool)((dynamic)browser).Busy || Convert.ToInt32(((dynamic)browser).ReadyState, CultureInfo.InvariantCulture) != 4)
+            return false; // Do not block native discovery on an initializing Document.
 
         object? document = null;
         object? folder = null;
@@ -776,7 +1013,32 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
     private void ApplySelection(object browser, IReadOnlyList<SelectedItem> selection)
     {
         if (selection.Count == 0)
-            return; // Verification requires the new tab to have no selection.
+        {
+            // This is reached with existing selection only for an exact,
+            // freshly verified managed rebase. Deselecting never changes files.
+            object? emptyDocument = null, selected = null;
+            var previous = new List<object>();
+            try
+            {
+                emptyDocument = ((dynamic)browser).Document;
+                selected = ((dynamic)emptyDocument).SelectedItems();
+                int count = ((dynamic)selected).Count;
+                for (var index = 0; index < count; index++)
+                    previous.Add(((dynamic)selected).Item(index));
+                foreach (var selectedItem in previous)
+                {
+                    object item = selectedItem;
+                    ((dynamic)emptyDocument).SelectItem(ref item, 0); // SVSI_DESELECT.
+                }
+            }
+            finally
+            {
+                foreach (var item in previous) ComReference.Release(item);
+                ComReference.Release(selected);
+                ComReference.Release(emptyDocument);
+            }
+            return;
+        }
 
         object? document = null;
         object? folder = null;
@@ -857,6 +1119,7 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         RefreshShell();
         DiagnosticPhase = "enumerate-native-windows";
         var native = requiredWindows is null ? ReadNativeWindows() : ReadNativeWindowScope(requiredWindows);
+        var expectedTabs = requiredWindows is null ? null : native.SelectMany(window => window.Tabs).ToHashSet();
         var snapshot = new RegisteredSnapshot();
         try
         {
@@ -864,12 +1127,16 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             DiagnosticPhase = "registered-tab-count";
             int count = shellWindows.Count;
             var seenTabs = new HashSet<nint>();
-            for (var index = 0; index < count; index++)
+            for (var visit = 0; visit < count; visit++)
             {
+                // Scoped sources are normally the newest registrations. Global
+                // snapshots retain their existing complete enumeration order.
+                var index = requiredWindows is null ? visit : count - 1 - visit;
                 object? browser = null;
                 IShellBrowser? shellBrowser = null;
                 try
                 {
+                    DiagnosticRegistryBrowsersVisited++;
                     browser = shellWindows.Item(index);
                     DiagnosticPhase = "registered-browser-window";
                     if (browser is null)
@@ -897,6 +1164,14 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
                     }
                     registered.Tabs.Add(new RegisteredTab(tab, browser));
                     browser = null; // The snapshot now owns this COM reference.
+                    if (expectedTabs is not null && seenTabs.SetEquals(expectedTabs))
+                    {
+                        // Completeness is the requested native handle set, not
+                        // uniqueness of global COM rows. Duplicate rows already
+                        // resolve to one association per tab. Fresh view/state
+                        // reads and the unchanged native cross-check still apply.
+                        break;
+                    }
                 }
                 catch (Exception exception) when (exception is COMException or InvalidComObjectException or
                     Microsoft.CSharp.RuntimeBinder.RuntimeBinderException)
@@ -1060,8 +1335,16 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
             throw new InvalidOperationException("The Explorer backend requires its owning WinForms STA message pump.");
     }
 
-    private void PruneVanishedTransfers() =>
-        _partialTransfers.RemoveAll(transfer => !IsExplorerWindow(transfer.Source) || !IsExplorerWindow(transfer.Target));
+    private void PruneVanishedTransfers()
+    {
+        _partialTransfers.RemoveAll(transfer => !IsOwnedBackgroundTransfer(transfer) &&
+            (!IsExplorerWindow(transfer.Source) || !IsExplorerWindow(transfer.Target)));
+        PrunePreparedSource();
+        // A vanished source does not cancel a posted tab command. Keep that
+        // global reservation until its handle is resolved or the target dies.
+        if (_pendingAllocation is not null && !IsExplorerWindow(_pendingAllocation.Target))
+            _pendingAllocation = null;
+    }
 
     private void RecordDiagnosticFailure(Exception exception)
     {
@@ -1091,10 +1374,16 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         _shellWindows = null;
         _paths?.Dispose();
         _paths = null;
+        _preparedOtherSource = null;
+        _nextPreparationCandidate = null;
+        _nextPreparationTarget = default;
         if (retainTransfers)
             PruneVanishedTransfers();
         else
+        {
             _partialTransfers.Clear();
+            _pendingAllocation = null;
+        }
         _generation++;
     }
 
@@ -1103,8 +1392,13 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
         if (_disposed)
             return;
         AssertContext();
-        ResetShell();
+        _acceptBackgroundTransfers = false;
         _disposed = true;
+        foreach (var job in _backgroundJobs.Values.ToArray()) job.Cancel();
+        if (_backgroundJobs.Count == 0)
+            ResetShell();
+        else
+            _releaseShellAfterBackground = true; // Never block the owning STA or release RCWs under a live job.
     }
 
     private sealed record SelectedItem(string Identity, string Name);
@@ -1136,12 +1430,16 @@ public sealed class ShellExplorerBackend : IExplorerBackend, IDisposable
     {
         internal WindowId Source { get; } = source;
         internal WindowId Target { get; } = target;
-        internal TabState SourceState { get; } = sourceState;
+        internal TabState SourceState { get; set; } = sourceState;
+        internal TabState? LastManagedState { get; set; }
+        internal TabState? RebaseFrom { get; set; }
         internal HashSet<nint> TargetBefore { get; set; } = [];
         internal nint TargetTab { get; set; }
         internal bool NewTabRequested { get; set; }
         internal bool NavigationIssued { get; set; }
         internal bool Verified { get; set; }
+        internal bool AllocationAmbiguous { get; set; }
+        internal bool BackgroundOwned { get; set; }
     }
 
     private sealed record NativeWindow(WindowId Id, nint[] Tabs);

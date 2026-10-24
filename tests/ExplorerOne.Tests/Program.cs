@@ -133,6 +133,69 @@ var cases = new (string Name, Func<Task> Run)[]
         var b = Backend(1); var c = new WindowCoordinator(b); await c.PollAsync();
         b.Windows.Clear(); await c.PollAsync(); Check(c.MainWindow is null && c.PendingCount == 0);
         b.Windows.Add(new(new(20, 200), 1)); await c.PollAsync(); Check(c.MainWindow == new WindowId(20, 200));
+    }),
+    ("Queued sources release routing while background copies remain pending", async () =>
+    {
+        var b = Backend(1, 2, 3);
+        b.Transfer = (_, _, _) => Task.FromResult(TransferResult.Queued);
+        b.PendingTransferCount = 2;
+        var c = new WindowCoordinator(b);
+        await c.PollAsync();
+        Check(c.PendingCount == 1 && c.BackgroundPendingCount == 2 && !c.IsBusy);
+        Check(c.Status == "Открытие вкладок…" && c.LastTransfer?.Result == TransferResult.Queued);
+        await c.PollAsync();
+        Check(b.Calls.Count == 2 && c.PendingCount == 0 && c.MainWindow == Id(1));
+        Check(c.NextPendingDelay is null);
+        await c.PollAsync();
+        Check(c.Status == "Открытие вкладок…" && b.Calls.Count == 2);
+        b.PendingTransferCount = 0;
+        await c.PollAsync();
+        Check(c.Status == "Один Проводник");
+    }),
+    ("A queued source still visible is observed again without losing the main", async () =>
+    {
+        var b = Backend(1, 2);
+        b.KeepQueuedSourceVisible = true;
+        b.Transfer = (_, _, _) => Task.FromResult(TransferResult.Queued);
+        var c = new WindowCoordinator(b, new FakeClock());
+        await c.PollAsync();
+        b.Transfer = (_, _, _) => Task.FromResult(TransferResult.NotReady);
+        await c.PollAsync();
+        Check(c.MainWindow == Id(1) && c.PendingCount == 1 && b.Calls.Count == 2);
+        Check(c.NextPendingDelay == TimeSpan.FromMilliseconds(25));
+    }),
+    ("Preparation is limited to the next ready observed single-tab source", async () =>
+    {
+        var inner = Backend(1, 2, 3, 4);
+        inner.Windows[0] = new(Id(1), 3);
+        inner.Windows[2] = new(Id(3), 2);
+        var b = new PreparingBackend(inner);
+        var c = new WindowCoordinator(b);
+        await c.PollAsync();
+        Check(inner.Calls.Single() == (Id(2), Id(1)));
+        Check(b.Plans.Single() == (Id(4), Id(1)));
+        Check(inner.Windows.Any(window => window.Id == Id(4)));
+    }),
+    ("Preparation excludes a source in cooldown and clears an absent plan", async () =>
+    {
+        var inner = Backend(1, 2, 3);
+        inner.Transfer = (source, _, _) => Task.FromResult(source == Id(2) ? TransferResult.Unsafe : TransferResult.Completed);
+        var b = new PreparingBackend(inner);
+        var c = new WindowCoordinator(b, new FakeClock());
+        await c.PollAsync();
+        await c.PollAsync();
+        Check(b.Plans.Count == 2 && b.Plans[0] == (Id(3), Id(1)) && b.Plans[1] == (null, Id(1)));
+        Check(inner.Calls.Select(call => call.Source).SequenceEqual([Id(2), Id(3)]));
+    }),
+    ("A multi-tab source does not enable speculative preparation", async () =>
+    {
+        var inner = Backend(1, 2, 3);
+        inner.Windows[0] = new(Id(1), 3);
+        inner.Windows[1] = new(Id(2), 2);
+        var b = new PreparingBackend(inner);
+        var c = new WindowCoordinator(b);
+        await c.PollAsync();
+        Check(b.Plans.Single() == (null, Id(1)) && inner.Calls.Single().Source == Id(2));
     })
 };
 cases = cases.Concat(SafetyCases.All).ToArray();
@@ -163,8 +226,11 @@ sealed class FakeClock : TimeProvider
     public override DateTimeOffset GetUtcNow() => _now;
     public void Advance(int seconds) => _now = _now.AddSeconds(seconds);
 }
-sealed class FakeBackend : IExplorerBackend
+sealed class FakeBackend : IExplorerBackend, IExplorerBackgroundBackend
 {
+    public int PendingTransferCount { get; set; }
+    public int FailedTransferCount { get; set; }
+    public bool KeepQueuedSourceVisible { get; set; }
     public List<ExplorerWindow> Windows { get; init; } = [];
     public List<(WindowId Source, WindowId Target)> Calls { get; } = [];
     public Func<WindowId, WindowId, CancellationToken, Task<TransferResult>>? Transfer { get; set; }
@@ -176,7 +242,17 @@ sealed class FakeBackend : IExplorerBackend
             throw new InvalidOperationException("Invalid transfer");
         Calls.Add((source, target));
         var result = Transfer is null ? TransferResult.Completed : await Transfer(source, target, ct);
-        if (result is TransferResult.Completed or TransferResult.SourceGone) Windows.RemoveAll(w => w.Id == source);
+        if (result is TransferResult.Completed or TransferResult.SourceGone ||
+            (result == TransferResult.Queued && !KeepQueuedSourceVisible)) Windows.RemoveAll(w => w.Id == source);
         return result;
     }
+}
+
+sealed class PreparingBackend(FakeBackend inner) : IExplorerBackend, IExplorerPreparationBackend
+{
+    public List<(WindowId? Candidate, WindowId Target)> Plans { get; } = [];
+    public IReadOnlyList<ExplorerWindow> EnumerateWindows() => inner.EnumerateWindows();
+    public Task<TransferResult> TransferAsync(WindowId source, WindowId target, CancellationToken cancellationToken) =>
+        inner.TransferAsync(source, target, cancellationToken);
+    public void SetPreparationCandidate(WindowId? candidate, WindowId target) => Plans.Add((candidate, target));
 }

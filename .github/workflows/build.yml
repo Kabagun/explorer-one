@@ -35,8 +35,8 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination publish/ExplorerOne-win-x64/
-          Copy-Item docs/manual-tests.md -Destination publish/ExplorerOne-win-x64/
-          Copy-Item docs/verification.md -Destination publish/ExplorerOne-win-x64/
+          New-Item -ItemType Directory -Path publish/ExplorerOne-win-x64/docs -Force | Out-Null
+          Copy-Item docs/manual-tests.md, docs/verification.md -Destination publish/ExplorerOne-win-x64/docs/
           Compress-Archive -Path publish/ExplorerOne-win-x64/* -DestinationPath ExplorerOne-win-x64.zip
 
       - name: Upload Windows x64 artifact

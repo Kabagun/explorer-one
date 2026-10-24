@@ -12,19 +12,27 @@ internal sealed class SourceWindowPresentation : IDisposable
     private static readonly TimeSpan InitialShowGrace = TimeSpan.FromMilliseconds(200);
     private readonly ISourceWindowPresentationNative _native;
     private readonly TimeProvider _clock;
+    private readonly object _gate = new();
     private readonly Dictionary<WindowId, Entry> _seen = [];
+    private WindowId? _mainWindow;
     private bool _disposed;
 
     public SourceWindowPresentation(ISourceWindowPresentationNative? native = null, TimeProvider? clock = null)
     {
         _native = native ?? new SourceWindowPresentationNative();
         _clock = clock ?? TimeProvider.System;
-        // A later SHOW for an existing window is not a new-window request.
+        // Only already visible windows belong to the startup baseline. Explorer
+        // can reuse a hidden preloaded frame for a genuinely new folder request.
         foreach (var window in _native.GetExistingWindows())
-            _seen.TryAdd(window, new Entry());
+            if (_native.IsVisible(window)) _seen.TryAdd(window, new Entry());
     }
 
     public TimeSpan? NextExpiryDelay
+    {
+        get { lock (_gate) return NextExpiryDelayCore; }
+    }
+
+    private TimeSpan? NextExpiryDelayCore
     {
         get
         {
@@ -43,12 +51,30 @@ internal sealed class SourceWindowPresentation : IDisposable
 
     public void OnShown(WindowId source, WindowId? main)
     {
+        lock (_gate)
+        {
+            _mainWindow = main;
+            OnShownCore(source, main);
+        }
+    }
+
+    // The native watcher never reads the coordinator or crosses into COM.
+    public void OnShown(WindowId source)
+    {
+        lock (_gate) OnShownCore(source, _mainWindow);
+    }
+
+    private void OnShownCore(WindowId source, WindowId? main)
+    {
         if (_disposed) return;
         Observe(main);
         if (_seen.ContainsKey(source) || !_native.IsValid(source)) return;
+        // A newly allocated Explorer frame may first appear iconic while its
+        // shell view initializes. Its first normal show is still a new request.
+        // Already minimized startup windows are protected by the baseline above.
+        if (!_native.IsVisible(source) || _native.IsMinimized(source)) return;
 
-        // Remember every observed identity, including first/main/already
-        // minimized windows. Restoring one must never trigger another minimize.
+        // A later restore of a window managed here must never re-minimize it.
         var entry = new Entry();
         _seen.Add(source, entry);
         if (!main.HasValue || source == main.Value || !_native.IsValid(main.Value) ||
@@ -70,6 +96,20 @@ internal sealed class SourceWindowPresentation : IDisposable
     }
 
     public void Observe(WindowId? main)
+    {
+        lock (_gate)
+        {
+            _mainWindow = main;
+            ObserveCore(main);
+        }
+    }
+
+    public void ObserveCurrentMain()
+    {
+        lock (_gate) ObserveCore(_mainWindow);
+    }
+
+    private void ObserveCore(WindowId? main)
     {
         if (_disposed) return;
         var validMain = main.HasValue && _native.IsValid(main.Value);
@@ -94,14 +134,24 @@ internal sealed class SourceWindowPresentation : IDisposable
 
     public void OnTransfer(WindowId source, TransferResult result)
     {
+        lock (_gate) OnTransferCore(source, result);
+    }
+
+    private void OnTransferCore(WindowId source, TransferResult result)
+    {
         if (_disposed || !_seen.TryGetValue(source, out var entry)) return;
         if (result is TransferResult.Completed or TransferResult.SourceGone)
             _seen.Remove(source);
-        else if (result != TransferResult.NotReady)
+        else if (result is not (TransferResult.NotReady or TransferResult.Queued))
             RestoreOwned(source, entry);
     }
 
     public void RestoreAll()
+    {
+        lock (_gate) RestoreAllCore();
+    }
+
+    private void RestoreAllCore()
     {
         foreach (var (window, entry) in _seen.ToArray())
             RestoreOwned(window, entry);
@@ -121,10 +171,13 @@ internal sealed class SourceWindowPresentation : IDisposable
 
     public void Dispose()
     {
-        if (_disposed) return;
-        _disposed = true;
-        RestoreAll();
-        _seen.Clear();
+        lock (_gate)
+        {
+            if (_disposed) return;
+            _disposed = true;
+            RestoreAllCore();
+            _seen.Clear();
+        }
     }
 
     private sealed class Entry
@@ -148,7 +201,7 @@ internal interface ISourceWindowPresentationNative
 
 internal sealed class SourceWindowPresentationNative : ISourceWindowPresentationNative
 {
-    private const int SwMinimize = 6;
+    private const int SwForceMinimize = 11;
     private const int SwRestore = 9;
     private const int SwShow = 5;
 
@@ -190,7 +243,15 @@ internal sealed class SourceWindowPresentationNative : ISourceWindowPresentation
 
     public bool IsVisible(WindowId window) => IsValid(window) && IsWindowVisible(window.Handle);
     public bool IsMinimized(WindowId window) => IsValid(window) && IsIconic(window.Handle);
-    public bool Minimize(WindowId window) => IsValid(window) && ShowWindowAsync(window.Handle, SwMinimize);
+    public bool Minimize(WindowId window)
+    {
+        if (!IsValid(window)) return false;
+        // The watcher belongs to another thread/process. Do not wait for the
+        // initializing Explorer thread to consume a queued minimize request.
+        // ShowWindow's return value is previous visibility, not success.
+        _ = ShowWindow(window.Handle, SwForceMinimize);
+        return IsValid(window) && IsIconic(window.Handle);
+    }
 
     public void Restore(WindowId window)
     {
@@ -229,6 +290,10 @@ internal sealed class SourceWindowPresentationNative : ISourceWindowPresentation
     [DllImport("user32.dll")]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool ShowWindowAsync(nint window, int command);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool ShowWindow(nint window, int command);
 
     [DllImport("user32.dll")]
     private static extern nint GetForegroundWindow();

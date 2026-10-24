@@ -1,6 +1,6 @@
 namespace ExplorerOne.Core;
 
-/// <summary>Serializes routing. It never closes windows; the backend owns the verified transfer.</summary>
+/// <summary>Serializes routing; the backend owns copying and the selected close policy.</summary>
 public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? clock = null)
 {
     private readonly TimeProvider _clock = clock ?? TimeProvider.System;
@@ -10,6 +10,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
     public WindowId? MainWindow { get; private set; }
     public bool IsBusy => Volatile.Read(ref _polling) != 0;
     public int PendingCount => Math.Max(0, _windows.Count - (MainWindow.HasValue ? 1 : 0));
+    public int BackgroundPendingCount => (backend as IExplorerBackgroundBackend)?.PendingTransferCount ?? 0;
     public (WindowId Source, TransferResult Result)? LastTransfer { get; private set; }
     public bool HasReadyPending => NextPendingDelay == TimeSpan.Zero;
     public TimeSpan? NextPendingDelay
@@ -77,7 +78,8 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                 .OrderBy(pair => pair.Value.Sequence).Select(pair => (WindowId?)pair.Key).FirstOrDefault();
             if (!source.HasValue)
             {
-                Status = PendingCount == 0 ? "Один Проводник" : "Окно сохранено; повтор позже";
+                Status = PendingCount != 0 ? "Окно сохранено; повтор позже" :
+                    BackgroundPendingCount != 0 ? "Открытие вкладок…" : "Один Проводник";
                 return;
             }
 
@@ -85,6 +87,18 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
             TransferResult result;
             try
             {
+                if (backend is IExplorerPreparationBackend preparation)
+                {
+                    // The backend receives only a source from this complete
+                    // routing inventory, respecting its existing cooldown.
+                    // Direct backend calls never acquire unrelated windows.
+                    var candidate = snapshot.Single(window => window.Id == source.Value).TabCount == 1
+                        ? _windows.Where(pair => pair.Key != MainWindow.Value && pair.Key != source.Value &&
+                                pair.Value.TabCount == 1 && pair.Value.RetryAt <= now)
+                            .OrderBy(pair => pair.Value.Sequence).Select(pair => (WindowId?)pair.Key).FirstOrDefault()
+                        : null;
+                    preparation.SetPreparationCandidate(candidate, MainWindow.Value);
+                }
                 result = await backend.TransferAsync(source.Value, MainWindow.Value, cancellationToken);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { throw; }
@@ -94,10 +108,10 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                 result = TransferResult.Retry;
             }
             LastTransfer = (source.Value, result);
-            if (result is TransferResult.Completed or TransferResult.SourceGone)
+            if (result is TransferResult.Completed or TransferResult.SourceGone or TransferResult.Queued)
             {
                 _windows.Remove(source.Value);
-                Status = "Перенос подтверждён";
+                Status = result == TransferResult.Queued ? "Открытие вкладок…" : "Перенос подтверждён";
             }
             else
             {
@@ -106,7 +120,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
                 if (result == TransferResult.NotReady)
                 {
                     observed.ReadinessFailures = Math.Min(3, observed.ReadinessFailures + 1);
-                    milliseconds = 100 << (observed.ReadinessFailures - 1);
+                    milliseconds = 25 << (observed.ReadinessFailures - 1);
                 }
                 else
                 {

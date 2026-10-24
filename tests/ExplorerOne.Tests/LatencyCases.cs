@@ -36,7 +36,7 @@ internal static class LatencyCases
             Check(coordinator.PendingCount == 1 && !coordinator.HasReadyPending);
             Check(coordinator.NextPendingDelay == TimeSpan.FromMilliseconds(250));
         }),
-        ("Not-ready results use a short backoff capped at 400 ms", async () =>
+        ("Not-ready results use a short backoff capped at 100 ms", async () =>
         {
             var backend = Backend(1, 2);
             var results = new Queue<TransferResult>([
@@ -44,7 +44,7 @@ internal static class LatencyCases
             backend.Transfer = (_, _, _) => Task.FromResult(results.Dequeue());
             var clock = new MillisecondClock();
             var coordinator = new WindowCoordinator(backend, clock);
-            var expectedDelays = new[] { 100, 200, 400, 400 };
+            var expectedDelays = new[] { 25, 50, 100, 100 };
 
             foreach (var delay in expectedDelays)
             {
@@ -60,6 +60,24 @@ internal static class LatencyCases
             }
 
             Check(backend.Calls.Count == expectedDelays.Length && coordinator.PendingCount == 1);
+        }),
+        ("A newly ready source is retried within 100 ms without a new window event", async () =>
+        {
+            var backend = Backend(1, 2);
+            var clock = new MillisecondClock();
+            var elapsed = 0;
+            backend.Transfer = (_, _, _) => Task.FromResult(
+                elapsed >= 130 ? TransferResult.Completed : TransferResult.NotReady);
+            var coordinator = new WindowCoordinator(backend, clock);
+            int? completedAt = null;
+            for (; elapsed <= 230; elapsed += 5)
+            {
+                await coordinator.PollAsync();
+                if (coordinator.PendingCount == 0) { completedAt = elapsed; break; }
+                clock.AdvanceMilliseconds(5);
+            }
+            Check(completedAt.HasValue && completedAt.Value >= 130 && completedAt.Value - 130 <= 100);
+            Check(backend.Windows.Count == 1);
         }),
         ("Normal retry starts at 250 ms and caps at 4 seconds", async () =>
         {

@@ -257,6 +257,87 @@ internal static class PresentationCases
 
             return Task.CompletedTask;
         }),
+        ("Queued close retains presentation ownership until disappearance or timeout", () =>
+        {
+            var main = Id(1);
+            var source = Id(2);
+            var native = new FakeNative(main);
+            var clock = new FakeClock();
+            using var presentation = new SourceWindowPresentation(native, clock);
+            native.AddWindow(source);
+            presentation.OnShown(source, main);
+            presentation.OnTransfer(source, TransferResult.Queued);
+            Check(native.Restored.Count == 0 && native.IsMinimized(source));
+            clock.Advance(TimeSpan.FromSeconds(4));
+            presentation.Observe(main);
+            Check(native.Restored.SequenceEqual([source]));
+
+            var gone = Id(3);
+            native.AddWindow(gone);
+            presentation.OnShown(gone, main);
+            presentation.OnTransfer(gone, TransferResult.Queued);
+            native.SetValid(gone, false);
+            presentation.Observe(main);
+            Check(native.Restored.SequenceEqual([source]) && presentation.NextExpiryDelay is null);
+            return Task.CompletedTask;
+        }),
+        ("A hidden preloaded frame is treated as a new window when first shown", () =>
+        {
+            var main = Id(1);
+            var source = Id(2);
+            var native = new FakeNative(main, source);
+            native.AddWindow(source, visible: false);
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(source, visible: true);
+            presentation.OnShown(source);
+            Check(native.MinimizeAttempts.SequenceEqual([source]));
+            Check(native.IsMinimized(source));
+            return Task.CompletedTask;
+        }),
+        ("A new iconic frame remains eligible at its first normal show", () =>
+        {
+            var main = Id(1);
+            var source = Id(2);
+            var native = new FakeNative(main);
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(source, minimized: true);
+            presentation.OnShown(source);
+            Check(native.MinimizeAttempts.Count == 0);
+            native.SetMinimized(source, false);
+            presentation.OnShown(source);
+            Check(native.MinimizeAttempts.SequenceEqual([source]));
+            presentation.OnTransfer(source, TransferResult.Unsafe);
+            presentation.OnShown(source);
+            Check(native.MinimizeAttempts.SequenceEqual([source]));
+            return Task.CompletedTask;
+        }),
+        ("Native show and expiry use the last published main without coordinator access", () =>
+        {
+            var main = Id(1);
+            var source = Id(2);
+            var native = new FakeNative(main);
+            var clock = new FakeClock();
+            using var presentation = new SourceWindowPresentation(native, clock);
+            presentation.Observe(main);
+            native.AddWindow(source);
+            presentation.OnShown(source);
+            Check(native.MinimizeAttempts.SequenceEqual([source]) && native.Activated.SequenceEqual([main]));
+            clock.Advance(TimeSpan.FromSeconds(4));
+            presentation.ObserveCurrentMain();
+            Check(native.Restored.SequenceEqual([source]));
+            presentation.Observe(null);
+            var next = Id(3);
+            native.AddWindow(next);
+            presentation.OnShown(next);
+            Check(native.MinimizeAttempts.SequenceEqual([source]));
+            presentation.Dispose();
+            presentation.OnShown(Id(4));
+            presentation.ObserveCurrentMain();
+            Check(native.Restored.SequenceEqual([source]));
+            return Task.CompletedTask;
+        }),
         ("Losing the main window restores an owned extra", () =>
         {
             var main = Id(1);
