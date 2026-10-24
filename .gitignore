@@ -1,0 +1,9 @@
+temp/
+work/
+outputs/
+publish/
+**/bin/
+**/obj/
+.vs/
+TestResults/
+*.user

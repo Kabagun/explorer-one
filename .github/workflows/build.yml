@@ -1,0 +1,48 @@
+name: Build Windows x64
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Run tests
+        run: dotnet run --project tests/ExplorerOne.Tests -c Release
+
+      - name: Build application
+        run: dotnet build src/ExplorerOne/ExplorerOne.csproj -c Release
+
+      - name: Publish self-contained Windows x64 application
+        run: dotnet publish src/ExplorerOne/ExplorerOne.csproj -c Release -r win-x64 --self-contained true -o publish/ExplorerOne-win-x64
+
+      - name: Package portable archive
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination publish/ExplorerOne-win-x64/
+          Copy-Item docs/manual-tests.md -Destination publish/ExplorerOne-win-x64/
+          Copy-Item docs/verification.md -Destination publish/ExplorerOne-win-x64/
+          Compress-Archive -Path publish/ExplorerOne-win-x64/* -DestinationPath ExplorerOne-win-x64.zip
+
+      - name: Upload Windows x64 artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExplorerOne-win-x64
+          path: ExplorerOne-win-x64.zip
+          if-no-files-found: error
+          retention-days: 30

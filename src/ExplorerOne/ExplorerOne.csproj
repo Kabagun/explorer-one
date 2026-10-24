@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <AssemblyName>ExplorerOne</AssemblyName>
+    <Description>One native Windows Explorer window with tabs</Description>
+    <Authors>Kabaye</Authors>
+  </PropertyGroup>
+  <ItemGroup><ProjectReference Include="../ExplorerOne.Core/ExplorerOne.Core.csproj" /></ItemGroup>
+</Project>
