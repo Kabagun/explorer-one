@@ -5,6 +5,54 @@ internal static class LatencyCases
 {
     internal static IEnumerable<(string Name, Func<Task> Run)> All =>
     [
+        ("Lifecycle discovery uses a validated existing main without a global COM scan", async () =>
+        {
+            var inner = Backend(1);
+            var backend = new HintBackend(inner);
+            var coordinator = new WindowCoordinator(backend);
+            await coordinator.PollAsync(preferFastDiscovery: true);
+            Check(backend.FullDiscoveries == 1 && backend.HintDiscoveries == 0 && coordinator.MainWindow == Id(1));
+            inner.Windows.Add(new ExplorerWindow(Id(2), 1));
+            await coordinator.PollAsync(preferFastDiscovery: true);
+            Check(backend.FullDiscoveries == 1 && backend.HintDiscoveries == 1);
+            Check(inner.Calls.Single() == (Id(2), Id(1)) && coordinator.PendingCount == 0);
+        }),
+        ("An unavailable main hint falls back to full discovery", async () =>
+        {
+            var inner = Backend(1);
+            var backend = new HintBackend(inner) { HintAvailable = false };
+            var coordinator = new WindowCoordinator(backend);
+            await coordinator.PollAsync();
+            inner.Windows.Add(new ExplorerWindow(Id(2), 1));
+            await coordinator.PollAsync(preferFastDiscovery: true);
+            Check(backend.FullDiscoveries == 2 && backend.HintDiscoveries == 1);
+            Check(inner.Calls.Single() == (Id(2), Id(1)));
+        }),
+        ("A vanished main cannot authorize hinted transfers", async () =>
+        {
+            var inner = Backend(1);
+            var backend = new HintBackend(inner);
+            var coordinator = new WindowCoordinator(backend);
+            await coordinator.PollAsync();
+            inner.Windows.Clear();
+            inner.Windows.Add(new ExplorerWindow(Id(2), 1));
+            await coordinator.PollAsync(preferFastDiscovery: true);
+            Check(backend.FullDiscoveries == 2 && backend.HintDiscoveries == 1);
+            Check(coordinator.MainWindow == Id(2) && inner.Calls.Count == 0);
+        }),
+        ("Hinted discovery preserves source rejection and retry policy", async () =>
+        {
+            var inner = Backend(1);
+            inner.Transfer = (_, _, _) => Task.FromResult(TransferResult.Unsafe);
+            var backend = new HintBackend(inner);
+            var coordinator = new WindowCoordinator(backend, new MillisecondClock());
+            await coordinator.PollAsync();
+            inner.Windows.Add(new ExplorerWindow(Id(2), 1));
+            await coordinator.PollAsync(preferFastDiscovery: true);
+            Check(coordinator.MainWindow == Id(1) && coordinator.PendingCount == 1);
+            Check(coordinator.LastTransfer is { Result: TransferResult.Unsafe });
+            Check(coordinator.NextPendingDelay == TimeSpan.FromSeconds(30));
+        }),
         ("Ready pending work drains one source at a time", async () =>
         {
             var backend = Backend(1, 2, 3);
@@ -274,6 +322,26 @@ internal static class LatencyCases
     };
 
     private static WindowId Id(int value) => new(value, 100);
+
+    private sealed class HintBackend(FakeBackend inner) : IExplorerBackend, IExplorerHintBackend
+    {
+        public int FullDiscoveries { get; private set; }
+        public int HintDiscoveries { get; private set; }
+        public bool HintAvailable { get; set; } = true;
+        public IReadOnlyList<ExplorerWindow> EnumerateWindows()
+        {
+            FullDiscoveries++;
+            return inner.EnumerateWindows();
+        }
+        public bool TryEnumerateRoutingHint(WindowId main, out IReadOnlyList<ExplorerWindow> windows)
+        {
+            HintDiscoveries++;
+            windows = inner.Windows.ToArray();
+            return HintAvailable && windows.Any(window => window.Id == main);
+        }
+        public Task<TransferResult> TransferAsync(WindowId source, WindowId target, CancellationToken cancellationToken) =>
+            inner.TransferAsync(source, target, cancellationToken);
+    }
 
     private static TabTransferStamp Stamp(nint tab, string location, string selection) =>
         new(tab, location, selection);

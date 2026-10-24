@@ -21,6 +21,7 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
 
     private readonly Action _requestPoll;
     private readonly Action<WindowId> _windowShown;
+    private readonly Action<WindowId>? _windowCreated;
     private readonly Action? _presentationPulse;
     private readonly WindowsFormsSynchronizationContext _ownerContext;
     private readonly WinEventCallback _callback;
@@ -29,7 +30,8 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
     private uint _workerThreadId;
     private int _queueReady, _active, _disposed, _pollPosted;
 
-    public ExplorerWakeupMonitor(Action requestPoll, Action<WindowId> windowShown, Action? presentationPulse = null)
+    public ExplorerWakeupMonitor(Action requestPoll, Action<WindowId> windowShown, Action? presentationPulse = null,
+        Action<WindowId>? windowCreated = null)
     {
         ArgumentNullException.ThrowIfNull(requestPoll);
         ArgumentNullException.ThrowIfNull(windowShown);
@@ -37,6 +39,7 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
             throw new InvalidOperationException("Explorer wakeup monitoring requires the owning WinForms context.");
         _requestPoll = requestPoll;
         _windowShown = windowShown;
+        _windowCreated = windowCreated;
         _presentationPulse = presentationPulse;
         _callback = OnWinEvent;
         _worker = new Thread(RunHookLoop) { IsBackground = true, Name = "ExplorerOne native window hints" };
@@ -148,7 +151,14 @@ internal sealed class ExplorerWakeupMonitor : IDisposable
             using var process = Process.GetProcessById(checked((int)processId));
             if (!string.Equals(process.ProcessName, "explorer", StringComparison.OrdinalIgnoreCase)) return;
             if (Volatile.Read(ref _disposed) != 0) return;
-            if (eventType != EventObjectCreate && IsWindowVisible(window))
+            if (eventType == EventObjectCreate)
+            {
+                // Suppress a newly allocated extra frame before its first
+                // visible show when Explorer supplies a CREATE notification.
+                try { _windowCreated?.Invoke(new WindowId(window, processId)); }
+                catch { /* SHOW remains an independent presentation retry. */ }
+            }
+            else if (IsWindowVisible(window))
             {
                 // The caller supplies a thread-safe, native-only presentation
                 // action. It must react even while owner COM calls are blocked.

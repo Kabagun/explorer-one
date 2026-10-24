@@ -40,6 +40,9 @@ internal sealed class TrayApplicationContext : ApplicationContext
     private bool _autoStartEnabled;
     private volatile bool _shuttingDown;
     private int _reportedBackgroundFailures;
+    private int _capturePrimeAttempts;
+    private long _nextCapturePrimeAttemptAt;
+    private bool _capturePrimed;
 
     public TrayApplicationContext()
     {
@@ -108,6 +111,18 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _presentation?.OnShown(source);
     }
 
+    private void OnExplorerWindowCreated(WindowId source)
+    {
+        if (!_shuttingDown)
+            _presentation?.OnCreated(source);
+    }
+
+    private void OnExplorerWindowExcluded(WindowId source)
+    {
+        if (!_shuttingDown)
+            _presentation?.OnTransfer(source, TransferResult.Unsafe);
+    }
+
     private void OnPresentationPulse()
     {
         if (!_shuttingDown)
@@ -125,8 +140,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         if (_shuttingDown)
             return;
 
-        // Out-of-context WinEvents arrive on this STA, including while a COM
-        // call pumps messages. Only request work; never enter the coordinator.
+        // Both posted native hints and Shell registration can arrive while a
+        // COM call pumps messages. Only request work; never enter the coordinator.
         _pollRequested = true;
         _registrationBurstUntil = Environment.TickCount64 + RegistrationBurstMilliseconds;
         if (_activePoll is not { IsCompleted: false })
@@ -176,6 +191,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
         {
             backend = new ShellExplorerBackend(closeSourceEarly: true);
             backend.BackgroundTransferChanged += OnExplorerWindowLifecycle;
+            backend.ShellWindowRegistered += OnExplorerWindowLifecycle;
+            backend.WindowExcluded += OnExplorerWindowExcluded;
             _coordinator = new WindowCoordinator(backend);
             _backend = backend;
             return true;
@@ -205,7 +222,8 @@ internal sealed class TrayApplicationContext : ApplicationContext
             {
                 _presentation ??= new SourceWindowPresentation();
                 _wakeupMonitorInitialized = true;
-                _wakeupMonitor = new ExplorerWakeupMonitor(OnExplorerWindowLifecycle, OnExplorerWindowShown, OnPresentationPulse);
+                _wakeupMonitor = new ExplorerWakeupMonitor(OnExplorerWindowLifecycle, OnExplorerWindowShown,
+                    OnPresentationPulse, OnExplorerWindowCreated);
             }
             if (_coordinator is null && !TryInitializeBackend())
                 return;
@@ -216,10 +234,21 @@ internal sealed class TrayApplicationContext : ApplicationContext
                 _lifetime.Token.ThrowIfCancellationRequested();
                 _pollRequested = false;
                 _presentation?.Observe(coordinator.MainWindow);
-                await coordinator.PollAsync(_lifetime.Token);
+                await coordinator.PollAsync(_lifetime.Token, preferFastDiscovery: RegistrationBurstActive);
                 if (coordinator.LastTransfer is { } transfer)
                     _presentation?.OnTransfer(transfer.Source, transfer.Result);
                 _presentation?.Observe(coordinator.MainWindow);
+                if (!_capturePrimed && _capturePrimeAttempts < 3 && coordinator.PendingCount == 0 &&
+                    coordinator.BackgroundPendingCount == 0 && coordinator.MainWindow is { } primeMain &&
+                    Environment.TickCount64 >= _nextCapturePrimeAttemptAt)
+                {
+                    // Pay the first read-only COM/binder setup while idle.
+                    // Native presentation already has the main, so a new
+                    // frame can still be suppressed while this read pumps.
+                    _capturePrimeAttempts++;
+                    _nextCapturePrimeAttemptAt = Environment.TickCount64 + 1000;
+                    _capturePrimed = _backend!.TryPrimeFastCapture(primeMain);
+                }
                 if (_shuttingDown)
                     return;
 
@@ -344,7 +373,11 @@ internal sealed class TrayApplicationContext : ApplicationContext
         _presentation = null;
         try { _lifetime.Dispose(); } catch { }
         if (_backend is not null)
+        {
             _backend.BackgroundTransferChanged -= OnExplorerWindowLifecycle;
+            _backend.ShellWindowRegistered -= OnExplorerWindowLifecycle;
+            _backend.WindowExcluded -= OnExplorerWindowExcluded;
+        }
         try { _backend?.Dispose(); } catch { }
         _backend = null;
         _coordinator = null;

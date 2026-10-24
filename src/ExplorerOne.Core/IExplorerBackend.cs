@@ -22,6 +22,15 @@ public interface IExplorerBackgroundBackend
     int FailedTransferCount { get; }
 }
 
+/// <summary>Native discovery during a lifecycle burst with a freshly validated existing main.</summary>
+public interface IExplorerHintBackend
+{
+    // Success must still return the complete native inventory. Source view
+    // support/readiness and close ownership remain TransferAsync requirements.
+    // False requests normal discovery, including a new main-window decision.
+    bool TryEnumerateRoutingHint(WindowId main, out IReadOnlyList<ExplorerWindow> windows);
+}
+
 /// <summary>Allows bounded preparation of another source already approved for routing.</summary>
 public interface IExplorerPreparationBackend
 {

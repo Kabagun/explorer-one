@@ -16,7 +16,7 @@ namespace ExplorerOne.Shell;
 /// Accesses Explorer on the owning WinForms STA. The default policy verifies
 /// before closing; explicitly selected early-close mode owns background copies.
 /// </summary>
-public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPreparationBackend, IExplorerBackgroundBackend, IDisposable
+public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPreparationBackend, IExplorerBackgroundBackend, IExplorerHintBackend, IDisposable
 {
     private static readonly Guid ShellWindowsClass = new("9BA05972-F6A8-11CF-A442-00A0C90A8F39");
     private static readonly Guid ShellApplicationClass = new("13709620-C279-11CE-A49E-444553540000");
@@ -26,6 +26,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
     private const int MaximumRetainedTransfers = 256;
 
     private readonly int _ownerThread = Environment.CurrentManagedThreadId;
+    private readonly SynchronizationContext _ownerContext;
     private readonly bool _closeSourceEarly;
     private readonly List<PartialTransfer> _partialTransfers = [];
     private object? _shellWindows;
@@ -54,6 +55,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
     internal int DiagnosticDestinationPollCount { get; private set; }
     internal long DiagnosticActivationMilliseconds { get; private set; }
     internal long DiagnosticInitialCaptureMilliseconds { get; private set; }
+    internal int DiagnosticLoadingFileCaptureCount { get; private set; }
     internal long DiagnosticFinalVerifyMilliseconds { get; private set; }
     internal long DiagnosticCloseCallMilliseconds { get; private set; }
     internal long DiagnosticCloseWaitMilliseconds { get; private set; }
@@ -70,10 +72,19 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
     internal long DiagnosticPreviousCloseWaitMilliseconds { get; private set; }
     internal long DiagnosticLastEnumerationMilliseconds { get; private set; }
     internal long DiagnosticLastControlPanelClassificationMilliseconds { get; private set; }
+    internal int DiagnosticLastControlPanelBrowsersVisited { get; private set; }
+    internal int DiagnosticLastControlPanelTabsClassified { get; private set; }
+    internal int DiagnosticLastControlPanelTabsAssociated { get; private set; }
+
+    /// <summary>A coalesced owner-STA hint; subscribers schedule work rather than reentering the backend.</summary>
+    public event Action? ShellWindowRegistered;
+    /// <summary>A positively excluded native root; subscribers may restore native presentation only.</summary>
+    public event Action<WindowId>? WindowExcluded;
 
     public ShellExplorerBackend(bool closeSourceEarly = false)
     {
         AssertContext();
+        _ownerContext = SynchronizationContext.Current!;
         _closeSourceEarly = closeSourceEarly;
     }
 
@@ -89,6 +100,11 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
             var excluded = FindKnownControlPanelWindows(native);
             if (!NativeWindowSetsEqual(native, ReadNativeWindows()))
                 throw new ShellSnapshotException();
+            foreach (var id in excluded)
+            {
+                try { WindowExcluded?.Invoke(id); }
+                catch { /* Presentation notifications cannot change discovery. */ }
+            }
             return native.Where(window => !excluded.Contains(window.Id))
                 .Select(window => new ExplorerWindow(window.Id, window.Tabs.Length)).ToArray();
         }
@@ -136,6 +152,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         DiagnosticDestinationPollCount = 0;
         DiagnosticActivationMilliseconds = 0;
         DiagnosticInitialCaptureMilliseconds = 0;
+        DiagnosticLoadingFileCaptureCount = 0;
         DiagnosticFinalVerifyMilliseconds = 0;
         DiagnosticCloseCallMilliseconds = 0;
         DiagnosticCloseWaitMilliseconds = 0;
@@ -173,7 +190,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
             {
                 WindowState captured;
                 var captureStartedAt = Stopwatch.GetTimestamp();
-                try { captured = CaptureRetainedWindow(sourceWindow, generation); }
+                try { captured = CaptureRetainedWindow(sourceWindow, generation, allowLoadingFileView: true); }
                 finally { DiagnosticInitialCaptureMilliseconds += ElapsedMilliseconds(captureStartedAt); }
                 var queued = await TryQueueBackgroundTransferAsync(captured, sourceWindow.Tabs[0], target, generation, cancellationToken);
                 if (queued.HasValue)
@@ -505,12 +522,12 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         }
     }
 
-    private WindowState CaptureRetainedWindow(RegisteredWindow window, int generation)
+    private WindowState CaptureRetainedWindow(RegisteredWindow window, int generation, bool allowLoadingFileView = false)
     {
         RefreshShell();
         if (generation != _generation || !NativeTabsMatch(window.Id, window.Tabs.Select(tab => tab.Handle)))
             throw new ShellSnapshotException();
-        var state = CaptureWindow(window);
+        var state = CaptureWindow(window, allowLoadingFileView);
         if (generation != _generation)
             throw new ShellSnapshotException();
         return state;
@@ -745,30 +762,42 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         finally { DiagnosticActivationMilliseconds += ElapsedMilliseconds(startedAt); }
     }
 
-    private WindowState CaptureWindow(RegisteredWindow window)
+    private WindowState CaptureWindow(RegisteredWindow window, bool allowLoadingFileView = false)
     {
-        var tabs = window.Tabs.Select(CaptureTab).ToArray();
+        var tabs = window.Tabs.Select(tab => CaptureTab(tab, allowLoadingFileView)).ToArray();
         if (!NativeTabsMatch(window.Id, tabs.Select(tab => tab.Handle)))
             throw new ShellSnapshotException();
         return new WindowState(window.Id, tabs);
     }
 
-    private TabState CaptureTab(RegisteredTab reference)
+    private TabState CaptureTab(RegisteredTab reference, bool allowLoadingFileView = false)
     {
         try
         {
             dynamic browser = reference.Browser;
             DiagnosticPhase = "tab-ready-state";
-            if ((bool)browser.Busy || Convert.ToInt32(browser.ReadyState, CultureInfo.InvariantCulture) != 4)
+            // Only a new fast transfer may read an already coherent file view
+            // before Explorer finishes loading. Namespace views still wait.
+            allowLoadingFileView = allowLoadingFileView && IsAbsoluteFileUrl((string)browser.LocationURL);
+            var loadingAtStart = (bool)browser.Busy || Convert.ToInt32(browser.ReadyState, CultureInfo.InvariantCulture) != 4;
+            if (loadingAtStart && !allowLoadingFileView)
                 throw new ShellSnapshotException();
 
             // A Document/SelectedItems COM object may remain readable after
             // Explorer has replaced its view. Obtain both afresh on each read.
-            var first = CaptureDocument(reference);
-            var second = CaptureDocument(reference);
-            if (first.Stamp != second.Stamp || (bool)browser.Busy ||
-                Convert.ToInt32(browser.ReadyState, CultureInfo.InvariantCulture) != 4)
+            var first = CaptureDocument(reference, allowLoadingFileView, out var firstLoading);
+            var second = CaptureDocument(reference, allowLoadingFileView, out var secondLoading);
+            var loadingAtEnd = (bool)browser.Busy || Convert.ToInt32(browser.ReadyState, CultureInfo.InvariantCulture) != 4;
+            var observedLoading = loadingAtStart || firstLoading || secondLoading || loadingAtEnd;
+            if (first.Stamp != second.Stamp || (observedLoading && !allowLoadingFileView))
                 throw new ShellSnapshotException();
+            if (observedLoading)
+            {
+                string finalUrl = browser.LocationURL;
+                if (!IsAbsoluteFileUrl(finalUrl) || !_paths!.Equivalent(second.Location, finalUrl))
+                    throw new ShellSnapshotException();
+                DiagnosticLoadingFileCaptureCount++;
+            }
             return second;
         }
         catch (COMException exception)
@@ -784,8 +813,13 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         }
     }
 
-    private TabState CaptureDocument(RegisteredTab reference)
+    private static bool IsAbsoluteFileUrl(string? url) =>
+        url is not null && url.StartsWith("file:", StringComparison.OrdinalIgnoreCase) &&
+        Uri.TryCreate(url, UriKind.Absolute, out var parsed) && parsed.IsFile;
+
+    private TabState CaptureDocument(RegisteredTab reference, bool allowLoadingFileView, out bool observedLoading)
     {
+        observedLoading = false;
         object? document = null;
         object? folder = null;
         object? self = null;
@@ -840,7 +874,9 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
 
             string finalUrl = browser.LocationURL;
             DiagnosticPhase = "validate-document-state";
-            if ((bool)browser.Busy || (int)((dynamic)selected).Count != count ||
+            observedLoading = (bool)browser.Busy;
+            if ((observedLoading && !(allowLoadingFileView && IsAbsoluteFileUrl(url) && IsAbsoluteFileUrl(finalUrl))) ||
+                (int)((dynamic)selected).Count != count ||
                 !_paths.Equivalent(location, (string)((dynamic)self).Path) ||
                 (!string.IsNullOrEmpty(finalUrl) && !_paths.Equivalent(location, finalUrl)))
                 throw new ShellSnapshotException();
@@ -909,33 +945,52 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
     private HashSet<WindowId> FindKnownControlPanelWindowsCore(IReadOnlyList<NativeWindow> native)
     {
         var excluded = new HashSet<WindowId>();
+        var associatedTabs = new HashSet<nint>();
+        var classifiedTabs = new HashSet<nint>();
+        DiagnosticLastControlPanelBrowsersVisited = 0;
+        DiagnosticLastControlPanelTabsClassified = 0;
+        DiagnosticLastControlPanelTabsAssociated = 0;
         if (native.Count == 0)
             return excluded;
         try
         {
             RefreshShell();
+            if (native.All(window => window.Tabs.Length == 0))
+                return excluded; // No COM row can prove an association to a missing native tab.
             dynamic shellWindows = _shellWindows!;
             int count = shellWindows.Count;
-            for (var index = 0; index < count; index++)
+            for (var index = count - 1; index >= 0; index--)
             {
                 object? browser = null;
                 IShellBrowser? shellBrowser = null;
                 try
                 {
+                    DiagnosticLastControlPanelBrowsersVisited++;
                     browser = shellWindows.Item(index);
                     if (browser is null)
                         continue;
                     nint browserWindow = new(Convert.ToInt64(((dynamic)browser).HWND, CultureInfo.InvariantCulture));
                     var root = ShellNative.GetAncestor(browserWindow, ShellNative.RootAncestor);
                     var window = native.FirstOrDefault(candidate => candidate.Id.Handle == root);
-                    if (window is null || excluded.Contains(window.Id) || !BrowserIsControlPanel(browser) ||
+                    if (window is null || excluded.Contains(window.Id) ||
                         browser is not IShellServiceProvider services)
                         continue;
                     var service = ShellBrowserInterface;
                     var iid = ShellBrowserInterface;
-                    if (services.QueryService(ref service, ref iid, out shellBrowser) >= 0 && shellBrowser is not null &&
-                        shellBrowser.GetWindow(out var tab) >= 0 && window.Tabs.Contains(tab) && NativeTabBelongsTo(window.Id, tab))
+                    if (services.QueryService(ref service, ref iid, out shellBrowser) < 0 || shellBrowser is null ||
+                        shellBrowser.GetWindow(out var tab) < 0 || !window.Tabs.Contains(tab) || !NativeTabBelongsTo(window.Id, tab))
+                        continue;
+                    if (!associatedTabs.Add(tab))
+                        continue; // Newest exact association is authoritative, as in scoped snapshots.
+                    DiagnosticLastControlPanelTabsAssociated = associatedTabs.Count;
+                    var classification = BrowserIsControlPanel(browser);
+                    if (classification == true)
                         excluded.Add(window.Id);
+                    else if (classification == false)
+                        classifiedTabs.Add(tab);
+                    // Null remains unknown/included; an older duplicate COM
+                    // row must not replace the newest associated tab's state.
+                    DiagnosticLastControlPanelTabsClassified = classifiedTabs.Count;
                 }
                 catch (Exception exception)
                 {
@@ -954,6 +1009,8 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
                     ComReference.Release(shellBrowser);
                     ComReference.Release(browser);
                 }
+                if (native.All(candidate => excluded.Contains(candidate.Id) || candidate.Tabs.All(associatedTabs.Contains)))
+                    break;
             }
         }
         catch (Exception exception)
@@ -966,15 +1023,15 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         return excluded;
     }
 
-    private static bool BrowserIsControlPanel(object browser)
+    private static bool? BrowserIsControlPanel(object browser)
     {
         string url = ((dynamic)browser).LocationURL;
         if (IsControlPanelLocation(url))
             return true;
-        if (!string.IsNullOrEmpty(url))
-            return false; // Ordinary file tabs need no view capture.
         if ((bool)((dynamic)browser).Busy || Convert.ToInt32(((dynamic)browser).ReadyState, CultureInfo.InvariantCulture) != 4)
-            return false; // Do not block native discovery on an initializing Document.
+            return null; // Do not count or request an initializing Document.
+        if (!string.IsNullOrEmpty(url))
+            return false; // A ready ordinary tab needs no view capture.
 
         object? document = null;
         object? folder = null;
@@ -983,10 +1040,13 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         {
             document = ((dynamic)browser).Document;
             if (document is null)
-                return false;
+                return null;
             folder = ((dynamic)document).Folder;
+            if (folder is null) return null;
             self = ((dynamic)folder).Self;
-            return IsControlPanelLocation((string)((dynamic)self).Path);
+            if (self is null) return null;
+            string path = ((dynamic)self).Path;
+            return string.IsNullOrEmpty(path) ? null : IsControlPanelLocation(path);
         }
         finally
         {
@@ -1221,7 +1281,10 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         if (process == 0)
             throw new ShellSnapshotException();
         if (_shellWindows is not null)
+        {
+            EnsureShellWindowEvents();
             return;
+        }
 
         try
         {
@@ -1229,6 +1292,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
             _shellWindows = Activator.CreateInstance(Type.GetTypeFromCLSID(ShellWindowsClass, true)!);
             if (_shellWindows is null)
                 throw new ShellSnapshotException();
+            EnsureShellWindowEvents();
         }
         catch
         {
@@ -1370,6 +1434,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
 
     private void ResetShell(bool retainTransfers = false)
     {
+        DisposeShellWindowEvents();
         ComReference.Release(_shellWindows);
         _shellWindows = null;
         _paths?.Dispose();
@@ -1394,6 +1459,7 @@ public sealed partial class ShellExplorerBackend : IExplorerBackend, IExplorerPr
         AssertContext();
         _acceptBackgroundTransfers = false;
         _disposed = true;
+        DisposeShellWindowEvents(); // Detach now; pumped work cannot reattach during Unadvise.
         foreach (var job in _backgroundJobs.Values.ToArray()) job.Cancel();
         if (_backgroundJobs.Count == 0)
             ResetShell();

@@ -29,7 +29,7 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
     }
     public string Status { get; private set; } = "Ожидание Проводника";
 
-    public async Task PollAsync(CancellationToken cancellationToken = default)
+    public async Task PollAsync(CancellationToken cancellationToken = default, bool preferFastDiscovery = false)
     {
         if (Interlocked.CompareExchange(ref _polling, 1, 0) != 0) return;
         try
@@ -37,7 +37,12 @@ public sealed class WindowCoordinator(IExplorerBackend backend, TimeProvider? cl
             LastTransfer = null;
             cancellationToken.ThrowIfCancellationRequested();
             // Do not discard a main window when COM has failed or is restarting.
-            var snapshot = backend.EnumerateWindows();
+            IReadOnlyList<ExplorerWindow> snapshot;
+            if (preferFastDiscovery && MainWindow.HasValue && backend is IExplorerHintBackend hints &&
+                hints.TryEnumerateRoutingHint(MainWindow.Value, out var hinted))
+                snapshot = hinted;
+            else
+                snapshot = backend.EnumerateWindows();
             var live = snapshot.Select(w => w.Id).ToHashSet();
             foreach (var gone in _windows.Keys.Where(id => !live.Contains(id)).ToArray())
                 _windows.Remove(gone);

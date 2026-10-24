@@ -5,6 +5,130 @@ internal static class PresentationCases
 {
     internal static IEnumerable<(string Name, Func<Task> Run)> All =>
     [
+        ("CREATE suppresses a new invisible frame before SHOW without minimizing", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            using var presentation = new SourceWindowPresentation(native);
+            presentation.Observe(main);
+            native.AddWindow(source, visible: false);
+            presentation.OnCreated(source);
+            Check(native.Style(source) == 0x80000 && native.Attributes(source).Alpha == 0);
+            Check(!native.IsVisible(source) && native.MinimizeAttempts.Count == 0);
+            native.SetVisible(source, true);
+            presentation.OnShown(source);
+            Check(native.IsVisible(source) && native.Attributes(source).Alpha == 0 && native.MinimizeAttempts.Count == 0);
+            presentation.Dispose();
+            Check(native.Style(source) == 0 && native.IsVisible(source));
+            return Task.CompletedTask;
+        }),
+        ("Skipped CREATE stays eligible for SHOW while startup main and iconic frames stay protected", () =>
+        {
+            var main = Id(1); var existing = Id(3); var source = Id(2);
+            var native = new FakeNative(main, existing) { AppearanceAvailable = true };
+            native.SetMinimized(existing, true);
+            using var presentation = new SourceWindowPresentation(native);
+            native.AddWindow(source, visible: false);
+            presentation.OnCreated(source); // No published main: must not mark seen.
+            Check(native.Style(source) == 0);
+            presentation.Observe(main);
+            presentation.OnCreated(main); presentation.OnShown(existing);
+            Check(native.Style(main) == 0 && native.Style(existing) == 0);
+            native.SetVisible(source, true); presentation.OnShown(source);
+            Check(native.Attributes(source).Alpha == 0 && native.Style(source) == 0x80000);
+            return Task.CompletedTask;
+        }),
+        ("Prelayered attributes restore exactly while unrelated new extended-style bits survive", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            using var presentation = new SourceWindowPresentation(native);
+            native.AddWindow(source);
+            var original = new LayeredWindowAttributes(0x123456, 73, 3);
+            native.SetAppearance(source, 0x80010, original);
+            presentation.OnShown(source, main);
+            Check(native.Attributes(source) == original with { Alpha = 0 });
+            native.SetAppearance(source, native.Style(source) | 0x80, native.Attributes(source));
+            presentation.OnTransfer(source, TransferResult.Unsafe);
+            Check(native.Style(source) == 0x80090 && native.Attributes(source) == original);
+            Check(native.MinimizeAttempts.Count == 0 && presentation.NextExpiryDelay is null);
+            return Task.CompletedTask;
+        }),
+        ("Unsnapshotable prelayered and partial alpha-write failures use reversible minimize fallback", () =>
+        {
+            foreach (var prelayered in new[] { false, true })
+            {
+                var main = Id(1); var source = Id(2);
+                var native = new FakeNative(main) { AppearanceAvailable = true, LayeredReadSucceeds = !prelayered, AlphaWriteFailures = prelayered ? 0 : 1 };
+                using var presentation = new SourceWindowPresentation(native);
+                native.AddWindow(source);
+                var original = new LayeredWindowAttributes(7, 123, 3);
+                native.SetAppearance(source, prelayered ? 0x80000u : 0u, original);
+                presentation.OnShown(source, main);
+                Check(native.Style(source) == (prelayered ? 0x80000u : 0u) && native.Attributes(source) == original);
+                Check(native.MinimizeAttempts.SequenceEqual([source]));
+                presentation.OnTransfer(source, TransferResult.Unsafe);
+                Check(native.Restored.SequenceEqual([source]));
+            }
+            return Task.CompletedTask;
+        }),
+        ("Queued alpha ownership restores on timeout, main loss, disposal and live claimed completion", () =>
+        {
+            foreach (var mode in new[] { 0, 1, 2, 3, 4 })
+            {
+                var main = Id(1); var source = Id(2);
+                var native = new FakeNative(main) { AppearanceAvailable = true };
+                var clock = new FakeClock();
+                using var presentation = new SourceWindowPresentation(native, clock);
+                native.AddWindow(source); presentation.OnShown(source, main);
+                presentation.OnTransfer(source, TransferResult.Queued);
+                Check(native.Attributes(source).Alpha == 0 && native.Style(source) == 0x80000);
+                if (mode == 0) { clock.Advance(TimeSpan.FromSeconds(4)); presentation.ObserveCurrentMain(); }
+                else if (mode == 1) presentation.Observe(null);
+                else if (mode == 2) presentation.Dispose();
+                else presentation.OnTransfer(source, mode == 3 ? TransferResult.Completed : TransferResult.SourceGone);
+                Check(native.Style(source) == 0 && native.IsVisible(source) && presentation.NextExpiryDelay is null);
+                var writes = native.StyleWrites;
+                presentation.OnShown(source, main);
+                Check(native.StyleWrites == writes && native.MinimizeAttempts.Count == 0);
+            }
+            return Task.CompletedTask;
+        }),
+        ("Failed exact alpha rollback makes frame visible and retries at a bounded cadence", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            var clock = new FakeClock();
+            using var presentation = new SourceWindowPresentation(native, clock);
+            native.AddWindow(source); presentation.OnShown(source, main);
+            native.SetAppearance(source, native.Style(source) | 0x80, native.Attributes(source));
+            native.StyleWriteFailures = 2;
+            presentation.OnTransfer(source, TransferResult.Unsafe);
+            Check(native.Style(source) == 0x80 && presentation.NextExpiryDelay == TimeSpan.FromMilliseconds(100));
+            var writes = native.StyleWrites;
+            presentation.ObserveCurrentMain();
+            Check(native.StyleWrites == writes && presentation.NextExpiryDelay == TimeSpan.FromMilliseconds(100));
+            clock.Advance(TimeSpan.FromMilliseconds(100)); presentation.ObserveCurrentMain();
+            Check(native.Style(source) == 0x80 && presentation.NextExpiryDelay is null);
+            return Task.CompletedTask;
+        }),
+        ("Alpha ownership releases on user restore and never touches a recycled identity", () =>
+        {
+            var main = Id(1); var source = Id(2);
+            var native = new FakeNative(main) { AppearanceAvailable = true };
+            var clock = new FakeClock();
+            using var presentation = new SourceWindowPresentation(native, clock);
+            native.AddWindow(source); presentation.OnShown(source, main);
+            clock.Advance(TimeSpan.FromMilliseconds(250)); native.SetMinimized(source, true); presentation.ObserveCurrentMain();
+            native.SetMinimized(source, false); presentation.OnShown(source);
+            Check(native.Style(source) == 0 && presentation.NextExpiryDelay is null);
+            var writes = native.StyleWrites; presentation.OnShown(source); Check(native.StyleWrites == writes);
+            var gone = Id(3); native.AddWindow(gone); presentation.OnShown(gone);
+            native.SetValid(gone, false); var recycled = new WindowId(gone.Handle, gone.ProcessId + 1); native.AddWindow(recycled);
+            writes = native.StyleWrites; presentation.OnTransfer(gone, TransferResult.SourceGone);
+            Check(native.StyleWrites == writes && native.Style(recycled) == 0);
+            return Task.CompletedTask;
+        }),
         ("Only a new visible extra window is temporarily minimized", () =>
         {
             var main = Id(1);
@@ -180,6 +304,7 @@ internal static class PresentationCases
                 native.AddWindow(source);
                 presentation.OnShown(source, main);
 
+                native.SetValid(source, false);
                 presentation.OnTransfer(source, result);
                 presentation.RestoreAll();
 
@@ -384,6 +509,11 @@ internal static class PresentationCases
         internal List<(string Action, WindowId Window)> Commands { get; } = [];
         internal bool MinimizeSucceeds { get; set; } = true;
         internal bool MinimizeBecomesIconic { get; set; } = true;
+        internal bool AppearanceAvailable { get; set; }
+        internal bool LayeredReadSucceeds { get; set; } = true;
+        internal int AlphaWriteFailures { get; set; }
+        internal int StyleWriteFailures { get; set; }
+        internal int StyleWrites { get; private set; }
 
         internal FakeNative(params WindowId[] existing)
         {
@@ -397,11 +527,33 @@ internal static class PresentationCases
 
         internal void SetValid(WindowId window, bool value) => _windows[window].Valid = value;
         internal void SetMinimized(WindowId window, bool value) => _windows[window].Minimized = value;
+        internal void SetVisible(WindowId window, bool value) => _windows[window].Visible = value;
+        internal uint Style(WindowId window) => _windows[window].Style;
+        internal LayeredWindowAttributes Attributes(WindowId window) => _windows[window].Attributes;
+        internal void SetAppearance(WindowId window, uint style, LayeredWindowAttributes attributes)
+        { _windows[window].Style = style; _windows[window].Attributes = attributes; }
 
         public IReadOnlyList<WindowId> GetExistingWindows() => _existing;
         public bool IsValid(WindowId window) => _windows.TryGetValue(window, out var state) && state.Valid;
         public bool IsVisible(WindowId window) => IsValid(window) && _windows[window].Visible;
         public bool IsMinimized(WindowId window) => IsValid(window) && _windows[window].Minimized;
+        public bool TryGetExtendedStyle(WindowId window, out uint style)
+        { style = IsValid(window) ? _windows[window].Style : 0; return AppearanceAvailable && IsValid(window); }
+        public bool TrySetExtendedStyle(WindowId window, uint style)
+        {
+            StyleWrites++;
+            if (!IsValid(window)) return false;
+            if (StyleWriteFailures > 0) { StyleWriteFailures--; return false; }
+            _windows[window].Style = style; return true;
+        }
+        public bool TryGetLayeredAttributes(WindowId window, out LayeredWindowAttributes attributes)
+        { attributes = IsValid(window) ? _windows[window].Attributes : default; return IsValid(window) && LayeredReadSucceeds; }
+        public bool TrySetLayeredAttributes(WindowId window, LayeredWindowAttributes attributes)
+        {
+            if (!IsValid(window)) return false;
+            if (AlphaWriteFailures > 0) { AlphaWriteFailures--; return false; }
+            _windows[window].Attributes = attributes; return true;
+        }
 
         public bool Minimize(WindowId window)
         {
@@ -426,7 +578,9 @@ internal static class PresentationCases
     private sealed class WindowState(bool valid, bool visible, bool minimized)
     {
         internal bool Valid { get; set; } = valid;
-        internal bool Visible { get; } = visible;
+        internal bool Visible { get; set; } = visible;
         internal bool Minimized { get; set; } = minimized;
+        internal uint Style { get; set; }
+        internal LayeredWindowAttributes Attributes { get; set; } = new(0, 255, 2);
     }
 }
