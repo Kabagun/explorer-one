@@ -2,6 +2,9 @@
 #include "NativeLaunchProtocol.h"
 
 namespace explorerone {
+// Source map name: Local\ExplorerOne.NativeSource.V1.<DLL basename>.<64hex>.
+// The suffix is SHA256(UTF-16LE invariant-lowercase absolute DLL path, no NUL),
+// isolating pinned copies loaded from different installation directories.
 HRESULT StartSourcePresentation(const NativeLaunchRequest& request) noexcept;
 HRESULT UpdateSourcePresentation(const NativeLaunchRequest& request) noexcept;
 void StopSourcePresentation() noexcept;

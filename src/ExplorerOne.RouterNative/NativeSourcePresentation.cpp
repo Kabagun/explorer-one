@@ -1,5 +1,6 @@
 #include "NativeSourcePresentation.h"
 #include <aclapi.h>
+#include <bcrypt.h>
 #include <sddl.h>
 #include <atomic>
 #include <cstddef>
@@ -91,12 +92,38 @@ HMODULE OwnModule(bool pin = false) noexcept {
     return module;
 }
 std::wstring MappingName() {
-    wchar_t path[32768]{};
+    wchar_t path[32768]{}, absolute[32768]{};
     const HMODULE module = OwnModule();
     const DWORD length = module ? GetModuleFileNameW(module, path, _countof(path)) : 0;
     if (!length || length >= _countof(path)) return {};
-    const auto* basename = wcsrchr(path, L'\\');
-    return std::wstring(L"Local\\ExplorerOne.NativeSource.V1.") + (basename ? basename + 1 : path);
+    const DWORD absoluteLength = GetFullPathNameW(path, _countof(absolute), absolute, nullptr);
+    if (!absoluteLength || absoluteLength >= _countof(absolute)) return {};
+    const auto* basename = wcsrchr(absolute, L'\\');
+    if (!basename || !basename[1]) return {};
+    const int foldedLength = LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, absolute,
+        static_cast<int>(absoluteLength), nullptr, 0, nullptr, nullptr, 0);
+    if (foldedLength <= 0) return {};
+    std::wstring folded(static_cast<size_t>(foldedLength), L'\0');
+    if (LCMapStringEx(LOCALE_NAME_INVARIANT, LCMAP_LOWERCASE, absolute, static_cast<int>(absoluteLength),
+        folded.data(), foldedLength, nullptr, nullptr, 0) != foldedLength) return {};
+    // Identical source-hash DLLs at different installations have independent
+    // pinned globals. Scope their maps by the invariant-lowercase absolute path,
+    // hashed as UTF-16LE without a terminal NUL; never expose that path in a name.
+    static_assert(sizeof(wchar_t) == 2);
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0) < 0) return {};
+    BYTE digest[32]{};
+    const NTSTATUS hashed = BCryptHash(algorithm, nullptr, 0, reinterpret_cast<PUCHAR>(folded.data()),
+        static_cast<ULONG>(folded.size() * sizeof(wchar_t)), digest, sizeof(digest));
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (hashed < 0) return {};
+    constexpr wchar_t hex[] = L"0123456789abcdef";
+    wchar_t encoded[65]{};
+    for (size_t index = 0; index < sizeof(digest); ++index) {
+        encoded[index * 2] = hex[digest[index] >> 4];
+        encoded[index * 2 + 1] = hex[digest[index] & 15];
+    }
+    return std::wstring(L"Local\\ExplorerOne.NativeSource.V1.") + (basename + 1) + L'.' + encoded;
 }
 bool ExplorerImage(HANDLE process) noexcept {
     wchar_t actual[32768]{}, windows[MAX_PATH]{};
@@ -415,6 +442,7 @@ HRESULT StartSourcePresentation(const NativeLaunchRequest& request) noexcept {
         if (configuration.count > MaximumBaseline) return g_lastResult = HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
         if (!enumerated || configuration.baselineComplete != 1) return g_lastResult = HRESULT_FROM_WIN32(ERROR_RETRY);
         const auto name = MappingName();
+        if (name.empty()) return g_lastResult = HRESULT_FROM_WIN32(ERROR_INVALID_NAME);
         const std::wstring sddl = L"O:" + std::wstring(configuration.sid) + L"D:P(A;;GA;;;" + configuration.sid + L")";
         LocalMemory descriptor;
         if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(), SDDL_REVISION_1,
