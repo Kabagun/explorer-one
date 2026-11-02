@@ -4,6 +4,7 @@
     <TargetFramework>net10.0-windows</TargetFramework>
     <UseWindowsForms>true</UseWindowsForms>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets/explorer-one.ico</ApplicationIcon>
     <AssemblyName>ExplorerOne</AssemblyName>
     <Description>One native Windows Explorer window with tabs</Description>
     <Authors>Kabaye</Authors>
@@ -13,6 +14,7 @@
   </PropertyGroup>
   <ItemGroup><ProjectReference Include="../ExplorerOne.Core/ExplorerOne.Core.csproj" /></ItemGroup>
   <ItemGroup>
+    <EmbeddedResource Include="Assets/explorer-one.ico" LogicalName="ExplorerOne.AppIcon.ico" />
     <Content Include="../ExplorerOne.RouterNative/vendor/minhook-1.3.4/LICENSE.txt" Link="MinHook.LICENSE.txt" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
   </ItemGroup>
   <Target Name="BuildNativeLaunchRouter" BeforeTargets="PrepareForBuild;GetCopyToPublishDirectoryItems"

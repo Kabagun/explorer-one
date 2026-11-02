@@ -29,9 +29,9 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
     private readonly ToolStripMenuItem _statusItem = new("Ожидание Проводника") { Enabled = false };
     private readonly ToolStripMenuItem _autoStartItem = new("Запускать при входе в Windows");
     private readonly ToolStripMenuItem _exitItem = new("Выход");
+    private readonly Icon _applicationIcon = LoadApplicationIcon();
     private readonly NotifyIcon _notifyIcon = new()
     {
-        Icon = SystemIcons.Application,
         Text = "Explorer One",
         Visible = false
     };
@@ -58,6 +58,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_exitItem);
 
+            _notifyIcon.Icon = _applicationIcon;
             _notifyIcon.ContextMenuStrip = _menu;
             _pollTimer.Tick += OnPollTimerTick;
             _autoStartItem.Click += OnAutoStartClick;
@@ -82,6 +83,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         {
             _pollTimer.Dispose();
             _notifyIcon.Dispose();
+            _applicationIcon.Dispose();
             _menu.Dispose();
             _lifetime.Dispose();
             throw;
@@ -411,6 +413,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
     {
         try { _notifyIcon.Visible = false; } catch { }
         try { _notifyIcon.Dispose(); } catch { }
+        try { _applicationIcon.Dispose(); } catch { }
         try { _menu.Dispose(); } catch { }
         try { _pollTimer.Dispose(); } catch { }
         try { _wakeupMonitor?.Dispose(); } catch { }
