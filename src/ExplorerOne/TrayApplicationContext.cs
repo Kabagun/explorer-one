@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Windows.Forms;
 using ExplorerOne.Core;
 using ExplorerOne.Shell;
+using ExplorerOne.Diagnostics;
 
 namespace ExplorerOne;
 
@@ -28,6 +29,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
     private readonly ContextMenuStrip _menu = new();
     private readonly ToolStripMenuItem _statusItem = new("Ожидание Проводника") { Enabled = false };
     private readonly ToolStripMenuItem _autoStartItem = new("Запускать при входе в Windows");
+    private readonly ToolStripMenuItem _logsItem = new("Открыть папку журналов");
     private readonly ToolStripMenuItem _exitItem = new("Выход");
     private readonly Icon _applicationIcon = LoadApplicationIcon();
     private readonly NotifyIcon _notifyIcon = new()
@@ -55,6 +57,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _menu.Items.Add(_statusItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_autoStartItem);
+            _menu.Items.Add(_logsItem);
             _menu.Items.Add(new ToolStripSeparator());
             _menu.Items.Add(_exitItem);
 
@@ -62,6 +65,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _notifyIcon.ContextMenuStrip = _menu;
             _pollTimer.Tick += OnPollTimerTick;
             _autoStartItem.Click += OnAutoStartClick;
+            _logsItem.Click += OnOpenLogsClick;
             _exitItem.Click += OnExitClick;
 
             try
@@ -241,12 +245,13 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _backend = backend;
             return true;
         }
-        catch
+        catch (Exception exception)
         {
             try { backend?.Dispose(); } catch { }
             _coordinator = null;
             _backend = null;
             _statusItem.Text = GenericPollError;
+            AppDiagnostics.Error("backend_initialization_failed", exception);
             return false;
         }
     }
@@ -280,6 +285,8 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
                 _presentation?.Observe(coordinator.MainWindow);
                 await coordinator.PollAsync(_lifetime.Token, preferFastDiscovery: RegistrationBurstActive);
                 await RefreshNativeRoutingAsync();
+                AppDiagnostics.PublishActivity(_backend!.DiagnosticPhase, coordinator.PendingCount,
+                    coordinator.BackgroundPendingCount, _backend.FailedTransferCount);
                 if (coordinator.LastTransfer is { } transfer)
                     _presentation?.OnTransfer(transfer.Source, transfer.Result);
                 _presentation?.Observe(coordinator.MainWindow);
@@ -314,8 +321,9 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _presentation?.RestoreAll();
             // Shutdown cancels waits; the active coordinator call is awaited before disposal.
         }
-        catch
+        catch (Exception exception)
         {
+            AppDiagnostics.Error("poll_failed", exception);
             if (!_shuttingDown)
                 _statusItem.Text = GenericPollError;
             // An incomplete enumeration must end this drain. Give Explorer a
@@ -338,9 +346,11 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _autoStartEnabled = StartupRegistration.IsEnabled();
             _autoStartItem.Checked = _autoStartEnabled;
             _statusItem.Text = _autoStartEnabled ? "Автозапуск включён." : "Автозапуск выключен.";
+            AppDiagnostics.Event("autostart_changed", _autoStartEnabled ? "enabled" : "disabled", flush: true);
         }
-        catch
+        catch (Exception exception)
         {
+            AppDiagnostics.Error("autostart_change_failed", exception);
             _autoStartItem.Checked = _autoStartEnabled;
             _statusItem.Text = "Не удалось изменить автозапуск.";
         }
@@ -352,6 +362,10 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         if (failures <= _reportedBackgroundFailures || _shuttingDown)
             return;
         _reportedBackgroundFailures = failures;
+        AppDiagnostics.Event("background_transfer_failed", metrics: new Dictionary<string, long>
+        {
+            ["total"] = failures, ["hresult"] = _backend?.DiagnosticFailureHResult ?? 0
+        }, flush: true);
         _statusItem.Text = "Не удалось открыть вкладку.";
         try
         {
@@ -361,7 +375,26 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         catch { }
     }
 
-    private void OnExitClick(object? sender, EventArgs e) => _ = ShutdownSafelyAsync();
+    private void OnOpenLogsClick(object? sender, EventArgs e)
+    {
+        try
+        {
+            var directory = AppDiagnostics.DirectoryPath;
+            Directory.CreateDirectory(directory);
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(directory) { UseShellExecute = true });
+        }
+        catch (Exception exception)
+        {
+            AppDiagnostics.Error("open_logs_failed", exception);
+            _statusItem.Text = "Не удалось открыть папку журналов.";
+        }
+    }
+
+    private void OnExitClick(object? sender, EventArgs e)
+    {
+        AppDiagnostics.ShutdownRequested("tray_exit");
+        _ = ShutdownSafelyAsync();
+    }
 
     private async Task ShutdownSafelyAsync()
     {
@@ -405,6 +438,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         finally
         {
             DisposeResources();
+            AppDiagnostics.Event("shutdown_cleanup_completed", flush: true);
             try { ExitThread(); } catch { }
         }
     }

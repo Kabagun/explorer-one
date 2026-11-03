@@ -1,4 +1,5 @@
 using ExplorerOne.Opening;
+using ExplorerOne.Diagnostics;
 
 namespace ExplorerOne;
 
@@ -37,10 +38,15 @@ internal sealed partial class TrayApplicationContext
             {
                 await _launchRouter.StopAsync(_lifetime.Token);
                 _nativeRoutingActive = false;
+                AppDiagnostics.PublishNativeStatus(_launchRouter.Status, false);
                 if (_backend is not null) _backend.NativeFolderRoutingEnabled = false;
             }
         }
-        catch { _statusItem.Text = "Не удалось изменить открытие папок."; }
+        catch (Exception exception)
+        {
+            AppDiagnostics.Error("folder_routing_setting_failed", exception);
+            _statusItem.Text = "Не удалось изменить открытие папок.";
+        }
         finally
         {
             _routingTransition = false;
@@ -62,13 +68,15 @@ internal sealed partial class TrayApplicationContext
         {
             await _launchRouter.UpdateAsync(_coordinator?.MainWindow, _lifetime.Token);
             _nativeRoutingActive = _launchRouter.IsActive;
+            AppDiagnostics.PublishNativeStatus(_launchRouter.Status, _nativeRoutingActive);
             if (_backend is not null) _backend.NativeFolderRoutingEnabled = _nativeRoutingActive;
             _folderRoutingItem.ToolTipText = _nativeRoutingActive
                 ? "Новые папки открываются сразу во вкладке."
                 : "Прямое открытие пока недоступно; используется перенос окон.";
         }
-        catch
+        catch (Exception exception)
         {
+            AppDiagnostics.Error("native_routing_update_failed", exception);
             _nativeRoutingActive = false;
             if (_backend is not null) _backend.NativeFolderRoutingEnabled = false;
         }
@@ -80,5 +88,6 @@ internal sealed partial class TrayApplicationContext
         if (_nativeRoutingUpdate is not null) await _nativeRoutingUpdate;
         await _launchRouter.DisposeAsync();
         _nativeRoutingActive = false;
+        AppDiagnostics.PublishNativeStatus(_launchRouter.Status, false);
     }
 }

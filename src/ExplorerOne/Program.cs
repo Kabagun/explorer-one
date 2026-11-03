@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Threading;
 using System.Windows.Forms;
+using ExplorerOne.Diagnostics;
 
 namespace ExplorerOne;
 
@@ -11,54 +12,84 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        var reason = "main_return";
+        var exitCode = 0;
+        try
+        {
+            AppDiagnostics.Start();
+            // Route unexpected UI failures to the same durable fatal record as
+            // startup failures, rather than continuing with unknown transfer state.
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+            reason = Run();
+        }
+        catch (Exception exception)
+        {
+            reason = "managed_exception";
+            exitCode = 1;
+            AppDiagnostics.Fatal("main_exception", exception);
+            try
+            {
+                MessageBox.Show(AppDiagnostics.IsEnabled
+                    ? "Произошла ошибка ExplorerOne. Подробности сохранены в журнале приложения."
+                    : "Произошла ошибка ExplorerOne. Записать журнал приложения не удалось.",
+                    "ExplorerOne", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            catch { }
+        }
+        finally
+        {
+            Environment.ExitCode = exitCode;
+            AppDiagnostics.Complete(reason, exitCode);
+        }
+    }
+
+    private static string Run()
+    {
         ApplicationConfiguration.Initialize();
 
         if (!OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22621))
         {
+            AppDiagnostics.Event("startup_rejected", "unsupported_windows", flush: true);
             MessageBox.Show(
                 "Для работы Explorer One требуется Windows 11 версии 22H2 или новее.",
                 "Explorer One",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
-            return;
+            return "unsupported_windows";
         }
 
         using var instanceMutex = new Mutex(true, InstanceMutexName, out var createdNew);
         if (!createdNew)
         {
+            AppDiagnostics.Event("startup_rejected", "already_running", flush: true);
             MessageBox.Show(
                 "Explorer One уже запущен.",
                 "Explorer One",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Information);
-            return;
+            return "already_running";
         }
 
         try
         {
             if (IsExplorerTabUtilityRunning())
             {
+                AppDiagnostics.Event("startup_rejected", "conflicting_utility", flush: true);
                 MessageBox.Show(
                     "Обнаружен запущенный Explorer Tab Utility. Закройте его перед запуском Explorer One.",
                     "Explorer One",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
-                return;
+                return "conflicting_utility";
             }
 
             WindowsFormsSynchronizationContext.AutoInstall = false;
             SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
             using var context = new TrayApplicationContext();
+            AppDiagnostics.Ready();
             Application.Run(context);
-        }
-        catch
-        {
-            MessageBox.Show(
-                "Не удалось запустить Explorer One.",
-                "Explorer One",
-                MessageBoxButtons.OK,
-                MessageBoxIcon.Error);
+            return AppDiagnostics.ShutdownReason ?? "message_loop_returned";
         }
         finally
         {
