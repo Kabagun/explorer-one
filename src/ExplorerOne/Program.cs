@@ -10,7 +10,7 @@ internal static class Program
     private const string InstanceMutexName = @"Local\ExplorerOne.Kabaye";
 
     [STAThread]
-    private static void Main()
+    private static void Main(string[] args)
     {
         var reason = "main_return";
         var exitCode = 0;
@@ -20,7 +20,7 @@ internal static class Program
             // Route unexpected UI failures to the same durable fatal record as
             // startup failures, rather than continuing with unknown transfer state.
             Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
-            reason = Run();
+            reason = Run(args.Contains("--enable-startup", StringComparer.Ordinal));
         }
         catch (Exception exception)
         {
@@ -43,7 +43,7 @@ internal static class Program
         }
     }
 
-    private static string Run()
+    private static string Run(bool enableStartup)
     {
         ApplicationConfiguration.Initialize();
 
@@ -86,7 +86,7 @@ internal static class Program
             WindowsFormsSynchronizationContext.AutoInstall = false;
             SynchronizationContext.SetSynchronizationContext(new WindowsFormsSynchronizationContext());
 
-            using var context = new TrayApplicationContext();
+            using var context = new TrayApplicationContext(enableStartup);
             AppDiagnostics.Ready();
             Application.Run(context);
             return AppDiagnostics.ShutdownReason ?? "message_loop_returned";

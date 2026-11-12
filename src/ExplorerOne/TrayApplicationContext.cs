@@ -50,7 +50,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
     private long _nextCapturePrimeAttemptAt;
     private bool _capturePrimed;
 
-    public TrayApplicationContext()
+    public TrayApplicationContext(bool enableStartup = false)
     {
         try
         {
@@ -68,16 +68,21 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _logsItem.Click += OnOpenLogsClick;
             _exitItem.Click += OnExitClick;
 
-            try { StartupRegistration.MigrateIfEnabled(); }
+            try
+            {
+                if (enableStartup) StartupRegistration.SetEnabled(true);
+                else StartupRegistration.MigrateIfEnabled();
+            }
             catch (Exception exception)
             {
                 // A failed migration leaves the previous registration intact.
-                AppDiagnostics.Error("startup_migration_failed", exception);
+                AppDiagnostics.Error("startup_registration_failed", exception);
             }
             try
             {
                 _autoStartEnabled = StartupRegistration.IsEnabled();
                 _autoStartItem.Checked = _autoStartEnabled;
+                AppDiagnostics.Event("startup_registration", _autoStartEnabled ? "enabled" : "disabled", flush: true);
             }
             catch
             {
