@@ -11,6 +11,13 @@ int main() {
         ++checks;
         if (!condition) { std::fprintf(stderr, "Failed: %s\n", name); std::exit(1); }
     };
+    using explorerone::FindExplorerFrameProfile;
+    check(FindExplorerFrameProfile(3268608, 0xFD64D9D7, 0x323000) != nullptr, "original profile retained");
+    check(FindExplorerFrameProfile(3284992, 0x8F9C8877, 0x327000) != nullptr, "updated profile candidate");
+    check(!FindExplorerFrameProfile(3284992, 0xFD64D9D7, 0x327000), "mixed profile timestamp rejected");
+    check(!FindExplorerFrameProfile(3268608, 0x8F9C8877, 0x327000), "mixed profile file size rejected");
+    check(!FindExplorerFrameProfile(3284992, 0x8F9C8877, 0x323000), "mixed profile image size rejected");
+    check(!FindExplorerFrameProfile(0, 0, 0), "unknown profile rejected");
     const BYTE root[]{ 0, 0 };
     const BYTE item[]{ 4, 0, 0xAB, 0xCD, 0, 0 };
     const BYTE multiple[]{ 3, 0, 0xAB, 4, 0, 0xCD, 0xEF, 0, 0 };

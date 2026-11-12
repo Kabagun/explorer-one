@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../src/ExplorerOne/StartupTaskDefinition.cs" Link="StartupTaskDefinition.cs" />
+    <Compile Include="../../src/ExplorerOne/StartupTaskScheduler.cs" Link="StartupTaskScheduler.cs" />
+  </ItemGroup>
+</Project>

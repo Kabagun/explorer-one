@@ -2,6 +2,7 @@
 #include "FolderTabRouting.h"
 #include "NativeRouteQueue.h"
 #include "NativeSourcePresentation.h"
+#include "ExplorerFrameProfile.h"
 #include "vendor/minhook-1.3.4/include/MinHook.h"
 #include <aclapi.h>
 #include <bcrypt.h>
@@ -18,14 +19,7 @@
 #include <vector>
 
 namespace {
-constexpr DWORD kExpectedTimestamp = 0xFD64D9D7;
-constexpr DWORD kExpectedImageSize = 0x00323000;
-constexpr LONGLONG kExpectedFileSize = 3268608;
-constexpr DWORD kHostRva = 0x1D8F90;
-constexpr DWORD kHostEnd = 0x1D8FE7;
 constexpr UINT_PTR kCleanupTimer = 1;
-constexpr BYTE kExpectedPrologue[] = { 0x4c,0x8b,0xdc,0x48,0x83,0xec,0x78,0x48,0x8b,0x84,0x24,0xb8,0x00,0x00,0x00,0x49,
-    0x89,0x43,0xd8,0x48,0x8b,0x84,0x24,0xb0,0x00,0x00,0x00,0x49,0x89,0x43,0xd0,0x48 };
 
 struct Handle final {
     HANDLE value = nullptr;
@@ -79,7 +73,7 @@ HWND g_agent = nullptr;
 HMODULE g_module = nullptr;
 bool g_pinned = false, g_initialized = false, g_removed = true;
 bool g_cleanupDeferred = false, g_foreignPatch = false, g_unsupported = false;
-BYTE g_ownedPatch[sizeof(kExpectedPrologue)]{};
+BYTE g_ownedPatch[32]{};
 HRESULT g_moduleValidation = E_PENDING;
 LONG g_mhInitialize = -1, g_mhCreate = -1, g_mhEnable = -1;
 LONG g_mhDisable = -1, g_mhRemove = -1, g_mhUninitialize = -1;
@@ -176,7 +170,7 @@ bool ValidTarget(const explorerone::RoutingTarget& target) noexcept {
 }
 
 // Keep a non-write/non-delete-shared handle open through patch installation.
-HRESULT ValidateModule(Handle& file, HMODULE& module) {
+HRESULT ValidateModule(Handle& file, HMODULE& module, const explorerone::ExplorerFrameProfile*& profile) {
     module = GetModuleHandleW(L"ExplorerFrame.dll");
     if (!module) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     wchar_t path[MAX_PATH]{}, system[MAX_PATH]{};
@@ -188,7 +182,7 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     file.value = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file.value == INVALID_HANDLE_VALUE) return LastErrorResult();
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file.value, &size) || size.QuadPart != kExpectedFileSize) return E_UNEXPECTED;
+    if (!GetFileSizeEx(file.value, &size)) return E_UNEXPECTED;
     IMAGE_DOS_HEADER dos{};
     DWORD read = 0;
     if (!ReadFile(file.value, &dos, sizeof(dos), &read, nullptr) || read != sizeof(dos) ||
@@ -197,13 +191,14 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     if (!SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN)) return LastErrorResult();
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadFile(file.value, &nt, sizeof(nt), &read, nullptr) || read != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt.FileHeader.TimeDateStamp != kExpectedTimestamp || nt.OptionalHeader.SizeOfImage != kExpectedImageSize) return E_UNEXPECTED;
+        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return E_UNEXPECTED;
+    profile = explorerone::FindExplorerFrameProfile(size.QuadPart, nt.FileHeader.TimeDateStamp, nt.OptionalHeader.SizeOfImage);
+    if (!profile) return E_UNEXPECTED;
     const auto* loadedDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
     if (loadedDos->e_magic != IMAGE_DOS_SIGNATURE || loadedDos->e_lfanew != dos.e_lfanew) return E_UNEXPECTED;
     const auto* loadedNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const BYTE*>(module) + loadedDos->e_lfanew);
-    if (loadedNt->Signature != IMAGE_NT_SIGNATURE || loadedNt->FileHeader.TimeDateStamp != kExpectedTimestamp ||
-        loadedNt->OptionalHeader.SizeOfImage != kExpectedImageSize) return E_UNEXPECTED;
+    if (loadedNt->Signature != IMAGE_NT_SIGNATURE || loadedNt->FileHeader.TimeDateStamp != profile->timestamp ||
+        loadedNt->OptionalHeader.SizeOfImage != profile->imageSize) return E_UNEXPECTED;
     Hash hash;
     NTSTATUS status = BCryptOpenAlgorithmProvider(&hash.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
     if (status < 0) return HRESULT_FROM_NT(status);
@@ -225,9 +220,7 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     BYTE digest[32]{};
     status = BCryptFinishHash(hash.hash, digest, sizeof(digest), 0);
     if (status < 0) return HRESULT_FROM_NT(status);
-    constexpr BYTE expectedDigest[] = { 0xb7,0xbd,0xa6,0x01,0x1c,0x0c,0x13,0xa8,0x1a,0x6e,0xa9,0x67,0x07,0x89,0xc3,0xec,
-        0xb2,0x41,0xca,0xf9,0x94,0xd3,0x1e,0x27,0x4a,0xdd,0x18,0x70,0x49,0x29,0xca,0x6d };
-    return memcmp(digest, expectedDigest, sizeof(digest)) == 0 ? S_OK : E_UNEXPECTED;
+    return memcmp(digest, profile->sha256.data(), sizeof(digest)) == 0 ? S_OK : E_UNEXPECTED;
 }
 
 struct ActiveCallback final {
@@ -303,7 +296,8 @@ HRESULT InstallHook() {
     if (!g_removed) return g_intercepting.load() && !g_foreignPatch ? S_OK : HRESULT_FROM_WIN32(ERROR_BUSY);
     Handle file;
     HMODULE frame = nullptr;
-    g_moduleValidation = ValidateModule(file, frame);
+    const explorerone::ExplorerFrameProfile* profile = nullptr;
+    g_moduleValidation = ValidateModule(file, frame, profile);
     if (FAILED(g_moduleValidation)) {
         // A fresh desktop process may load ExplorerFrame only on its first
         // folder launch. Let the controller retry this transient absence.
@@ -311,11 +305,11 @@ HRESULT InstallHook() {
         g_unsupported = g_moduleValidation != HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
         return g_moduleValidation;
     }
-    const auto target = reinterpret_cast<HostShowWindow>(reinterpret_cast<std::uintptr_t>(frame) + kHostRva);
+    const auto target = reinterpret_cast<HostShowWindow>(reinterpret_cast<std::uintptr_t>(frame) + profile->hostRva);
     DWORD64 unwindBase = 0;
     const auto* unwind = RtlLookupFunctionEntry(reinterpret_cast<DWORD64>(target), &unwindBase, nullptr);
-    if (!unwind || unwindBase != reinterpret_cast<DWORD64>(frame) || unwind->BeginAddress != kHostRva || unwind->EndAddress != kHostEnd ||
-        memcmp(reinterpret_cast<const void*>(target), kExpectedPrologue, sizeof(kExpectedPrologue)) != 0) {
+    if (!unwind || unwindBase != reinterpret_cast<DWORD64>(frame) || unwind->BeginAddress != profile->hostRva || unwind->EndAddress != profile->hostEnd ||
+        memcmp(reinterpret_cast<const void*>(target), profile->hostPrologue.data(), profile->hostPrologue.size()) != 0) {
         g_unsupported = true;
         g_moduleValidation = E_UNEXPECTED;
         return E_UNEXPECTED;

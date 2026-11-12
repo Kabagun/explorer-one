@@ -1,5 +1,6 @@
 #include "TargetFolderBridge.h"
 #include "TargetFolderProtocol.h"
+#include "ExplorerFrameProfile.h"
 #include <aclapi.h>
 #include <bcrypt.h>
 #include <exdisp.h>
@@ -18,11 +19,6 @@
 using Microsoft::WRL::ComPtr;
 
 namespace {
-constexpr DWORD kExpectedTimestamp = 0xFD64D9D7;
-constexpr DWORD kExpectedImageSize = 0x00323000;
-constexpr LONGLONG kExpectedFileSize = 3268608;
-constexpr std::uintptr_t kTabActionsVtableRva = 0x27B090;
-constexpr std::uintptr_t kBrowserServiceVtableRva = 0x27E450;
 constexpr GUID kBrowserServiceIid = { 0xdfbc7e30, 0xf9e5, 0x455f, { 0x88, 0xf8, 0xfa, 0x98, 0xc1, 0xe4, 0x94, 0xca } };
 constexpr GUID kTabActionsIids[] = {
     { 0x5bfad855, 0xec86, 0x44d9, { 0x9e, 0xb5, 0x4e, 0x71, 0x4e, 0x07, 0x3b, 0xb5 } },
@@ -205,7 +201,7 @@ bool ExpectedTargetProcess(HANDLE process, DWORD pid, ULONGLONG start, DWORD ses
     return TokenSid(process, actualSid) && actualSid == sid;
 }
 
-HRESULT ValidateModule(Handle& file, HMODULE& module) {
+HRESULT ValidateModule(Handle& file, HMODULE& module, const explorerone::ExplorerFrameProfile*& profile) {
     module = GetModuleHandleW(L"ExplorerFrame.dll");
     if (!module) return HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND);
     wchar_t path[MAX_PATH]{}, system[MAX_PATH]{};
@@ -216,7 +212,7 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     file.value = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file.value == INVALID_HANDLE_VALUE) return LastErrorResult();
     LARGE_INTEGER size{};
-    if (!GetFileSizeEx(file.value, &size) || size.QuadPart != kExpectedFileSize) return E_UNEXPECTED;
+    if (!GetFileSizeEx(file.value, &size) || size.QuadPart <= 0) return E_UNEXPECTED;
     IMAGE_DOS_HEADER dos{};
     DWORD read = 0;
     if (!ReadFile(file.value, &dos, sizeof(dos), &read, nullptr) || read != sizeof(dos) ||
@@ -225,13 +221,14 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     if (!SetFilePointerEx(file.value, position, nullptr, FILE_BEGIN)) return LastErrorResult();
     IMAGE_NT_HEADERS64 nt{};
     if (!ReadFile(file.value, &nt, sizeof(nt), &read, nullptr) || read != sizeof(nt) || nt.Signature != IMAGE_NT_SIGNATURE ||
-        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        nt.FileHeader.TimeDateStamp != kExpectedTimestamp || nt.OptionalHeader.SizeOfImage != kExpectedImageSize) return E_UNEXPECTED;
+        nt.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 || nt.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return E_UNEXPECTED;
+    profile = explorerone::FindExplorerFrameProfile(size.QuadPart, nt.FileHeader.TimeDateStamp, nt.OptionalHeader.SizeOfImage);
+    if (!profile) return E_UNEXPECTED;
     const auto* loadedDos = reinterpret_cast<const IMAGE_DOS_HEADER*>(module);
     if (!Readable(loadedDos, sizeof(*loadedDos)) || loadedDos->e_magic != IMAGE_DOS_SIGNATURE || loadedDos->e_lfanew != dos.e_lfanew) return E_UNEXPECTED;
     const auto* loadedNt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(reinterpret_cast<const BYTE*>(module) + dos.e_lfanew);
     if (!Readable(loadedNt, sizeof(*loadedNt)) || loadedNt->Signature != IMAGE_NT_SIGNATURE ||
-        loadedNt->FileHeader.TimeDateStamp != kExpectedTimestamp || loadedNt->OptionalHeader.SizeOfImage != kExpectedImageSize) return E_UNEXPECTED;
+        loadedNt->FileHeader.TimeDateStamp != profile->timestamp || loadedNt->OptionalHeader.SizeOfImage != profile->imageSize) return E_UNEXPECTED;
     Hash hash;
     NTSTATUS status = BCryptOpenAlgorithmProvider(&hash.algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
     if (status < 0) return HRESULT_FROM_NT(status);
@@ -253,12 +250,10 @@ HRESULT ValidateModule(Handle& file, HMODULE& module) {
     BYTE digest[32]{};
     status = BCryptFinishHash(hash.hash, digest, sizeof(digest), 0);
     if (status < 0) return HRESULT_FROM_NT(status);
-    constexpr BYTE expected[] = { 0xb7,0xbd,0xa6,0x01,0x1c,0x0c,0x13,0xa8,0x1a,0x6e,0xa9,0x67,0x07,0x89,0xc3,0xec,
-        0xb2,0x41,0xca,0xf9,0x94,0xd3,0x1e,0x27,0x4a,0xdd,0x18,0x70,0x49,0x29,0xca,0x6d };
-    if (memcmp(digest, expected, sizeof(expected))) return E_UNEXPECTED;
+    if (memcmp(digest, profile->sha256.data(), sizeof(digest))) return E_UNEXPECTED;
     // This profile's .text raw offsets equal its RVAs. Compare the invoked
     // entry points too, rejecting an independently patched private method.
-    for (const DWORD rva : { 0x1BA950u, 0x1BA980u, 0x12E640u, 0xF1DD0u, 0xBB870u }) {
+    for (const DWORD rva : { profile->addTab, profile->addTabAtIndex, profile->selectTab, profile->updateWindowList, profile->getPidl }) {
         BYTE prologue[32]{};
         position.QuadPart = rva;
         const auto* loaded = reinterpret_cast<const BYTE*>(module) + rva;
@@ -300,18 +295,18 @@ bool SamePidl(const std::vector<BYTE>& left, const std::vector<BYTE>& right) noe
     return !left.empty() && !right.empty() &&
         ILIsEqual(reinterpret_cast<PCIDLIST_ABSOLUTE>(left.data()), reinterpret_cast<PCIDLIST_ABSOLUTE>(right.data()));
 }
-bool ValidBrowserService(IUnknown* service, HMODULE module) noexcept {
+bool ValidBrowserService(IUnknown* service, HMODULE module, const explorerone::ExplorerFrameProfile& profile) noexcept {
     if (!service || !Readable(service, sizeof(void*))) return false;
     const auto* vtable = *reinterpret_cast<void***>(service);
-    const auto* expected = reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(module) + kBrowserServiceVtableRva);
+    const auto* expected = reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(module) + profile.browserServiceVtable);
     return vtable == expected &&
         Readable(vtable, 15 * sizeof(void*)) &&
-        vtable[10] == reinterpret_cast<const BYTE*>(module) + 0xF1DD0 &&
-        vtable[14] == reinterpret_cast<const BYTE*>(module) + 0xBB870;
+        vtable[10] == reinterpret_cast<const BYTE*>(module) + profile.updateWindowList &&
+        vtable[14] == reinterpret_cast<const BYTE*>(module) + profile.getPidl;
 }
-HRESULT ReadRegistrationFolder(const TargetFolderRequest& request, HMODULE module,
+HRESULT ReadRegistrationFolder(const TargetFolderRequest& request, HMODULE module, const explorerone::ExplorerFrameProfile& profile,
     const BrowserRegistration& registration, std::vector<BYTE>& folder) {
-    if (!OwnTarget(request) || !ValidBrowserService(registration.service.Get(), module)) return E_UNEXPECTED;
+    if (!OwnTarget(request) || !ValidBrowserService(registration.service.Get(), module, profile)) return E_UNEXPECTED;
     HWND browserWindow = nullptr;
     HRESULT result = registration.browser->GetWindow(&browserWindow);
     if (FAILED(result)) return result;
@@ -339,7 +334,7 @@ HRESULT ReadRegistrationFolder(const TargetFolderRequest& request, HMODULE modul
     if (!native.value || !CopyPidl(native.value, ownFolder) || !SamePidl(folder, ownFolder)) return E_UNEXPECTED;
     return S_OK;
 }
-HRESULT AcquireRegistrations(const TargetFolderRequest& request, HMODULE module, HWND created,
+HRESULT AcquireRegistrations(const TargetFolderRequest& request, HMODULE module, const explorerone::ExplorerFrameProfile& profile, HWND created,
     std::vector<BrowserRegistration>& result) {
     ComPtr<IShellWindows> windows;
     HRESULT status = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows));
@@ -369,7 +364,7 @@ HRESULT AcquireRegistrations(const TargetFolderRequest& request, HMODULE module,
             std::any_of(result.begin(), result.end(), [&](const auto& existing) { return existing.tab == candidate.tab; })) continue;
         status = candidate.browser->QueryInterface(kBrowserServiceIid, reinterpret_cast<void**>(candidate.service.GetAddressOf()));
         if (FAILED(status) || !candidate.service) return FAILED(status) ? status : E_NOINTERFACE;
-        if (FAILED(status = ReadRegistrationFolder(request, module, candidate, candidate.folder))) return status;
+        if (FAILED(status = ReadRegistrationFolder(request, module, profile, candidate, candidate.folder))) return status;
         result.push_back(std::move(candidate));
     }
     const size_t expected = static_cast<size_t>(request.beforeCount) + (created ? 1 : 0);
@@ -383,11 +378,11 @@ HRESULT AcquireRegistrations(const TargetFolderRequest& request, HMODULE module,
     });
     return S_OK;
 }
-HRESULT RefreshRegistrations(const TargetFolderRequest& request, HMODULE module, HWND created,
+HRESULT RefreshRegistrations(const TargetFolderRequest& request, HMODULE module, const explorerone::ExplorerFrameProfile& profile, HWND created,
     const std::vector<BrowserRegistration>& originals) {
     if (!created || FindCreatedTab(request) != created) return E_UNEXPECTED;
     std::vector<BrowserRegistration> fresh;
-    HRESULT result = AcquireRegistrations(request, module, created, fresh);
+    HRESULT result = AcquireRegistrations(request, module, profile, created, fresh);
     if (FAILED(result)) return result;
     std::vector<BYTE> desired(request.pidl, request.pidl + request.pidlBytes);
     // Validate the whole set before updating any registration. Original folders
@@ -402,7 +397,7 @@ HRESULT RefreshRegistrations(const TargetFolderRequest& request, HMODULE module,
     using UpdateWindowList = HRESULT (STDMETHODCALLTYPE*)(IUnknown*);
     for (const auto& registration : fresh) {
         std::vector<BYTE> current;
-        if (FindCreatedTab(request) != created || FAILED(result = ReadRegistrationFolder(request, module, registration, current)) ||
+        if (FindCreatedTab(request) != created || FAILED(result = ReadRegistrationFolder(request, module, profile, registration, current)) ||
             !SamePidl(current, registration.folder)) return FAILED(result) ? result : E_UNEXPECTED;
         const auto* vtable = *reinterpret_cast<void***>(registration.service.Get());
         const auto update = reinterpret_cast<UpdateWindowList>(vtable[10]);
@@ -412,7 +407,7 @@ HRESULT RefreshRegistrations(const TargetFolderRequest& request, HMODULE module,
     }
     return S_OK;
 }
-HRESULT AcquireActions(const TargetFolderRequest& request, HMODULE module, ComPtr<IUnknown>& actions) {
+HRESULT AcquireActions(const TargetFolderRequest& request, HMODULE module, const explorerone::ExplorerFrameProfile& profile, ComPtr<IUnknown>& actions) {
     ComPtr<IShellWindows> windows;
     HRESULT result = CoCreateInstance(CLSID_ShellWindows, nullptr, CLSCTX_ALL, IID_PPV_ARGS(&windows));
     if (FAILED(result)) return result;
@@ -441,10 +436,10 @@ HRESULT AcquireActions(const TargetFolderRequest& request, HMODULE module, ComPt
         }
         if (FAILED(result) || !actions) return FAILED(result) ? result : E_NOINTERFACE;
         const auto* vtable = *reinterpret_cast<void***>(actions.Get());
-        const auto* expected = reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(module) + kTabActionsVtableRva);
+        const auto* expected = reinterpret_cast<const void*>(reinterpret_cast<std::uintptr_t>(module) + profile.tabActionsVtable);
         if (vtable != expected || !Readable(vtable, 6 * sizeof(void*)) ||
-            vtable[3] != reinterpret_cast<const BYTE*>(module) + 0x1BA950 ||
-            vtable[5] != reinterpret_cast<const BYTE*>(module) + 0x12E640) return E_NOINTERFACE;
+            vtable[3] != reinterpret_cast<const BYTE*>(module) + profile.addTab ||
+            vtable[5] != reinterpret_cast<const BYTE*>(module) + profile.selectTab) return E_NOINTERFACE;
         ComPtr<IOleWindow> frameWindow;
         HWND actualRoot = nullptr;
         if (FAILED(result = actions.As(&frameWindow)) || FAILED(result = frameWindow->GetWindow(&actualRoot))) return result;
@@ -464,12 +459,14 @@ HRESULT Execute(TargetFolderRequest& shared, const TargetFolderRequest& request,
     Handle moduleFile;
     HMODULE module = nullptr;
     shared.stage = 2;
-    if (FAILED(result = ValidateModule(moduleFile, module))) return result;
+    const explorerone::ExplorerFrameProfile* verifiedProfile = nullptr;
+    if (FAILED(result = ValidateModule(moduleFile, module, verifiedProfile))) return result;
+    const auto& profile = *verifiedProfile;
     ComPtr<IUnknown> actions;
     shared.stage = 3;
-    if (FAILED(result = AcquireActions(request, module, actions))) return result;
+    if (FAILED(result = AcquireActions(request, module, profile, actions))) return result;
     std::vector<BrowserRegistration> originals;
-    if (FAILED(result = AcquireRegistrations(request, module, nullptr, originals))) return result;
+    if (FAILED(result = AcquireRegistrations(request, module, profile, nullptr, originals))) return result;
     Pidl folder;
     folder.value = ILCloneFull(reinterpret_cast<PCIDLIST_ABSOLUTE>(request.pidl));
     if (!folder.value) return E_OUTOFMEMORY;
@@ -490,7 +487,7 @@ HRESULT Execute(TargetFolderRequest& shared, const TargetFolderRequest& request,
     if (FAILED(result = select(actions.Get(), created))) return result;
     shared.createdTab = reinterpret_cast<std::uint64_t>(FindCreatedTab(request));
     shared.stage = 7;
-    if (FAILED(result = RefreshRegistrations(request, module, reinterpret_cast<HWND>(shared.createdTab), originals))) return result;
+    if (FAILED(result = RefreshRegistrations(request, module, profile, reinterpret_cast<HWND>(shared.createdTab), originals))) return result;
     if (OwnTarget(request)) {
         const auto root = reinterpret_cast<HWND>(request.targetRoot);
         if (IsIconic(root)) ShowWindow(root, SW_RESTORE);

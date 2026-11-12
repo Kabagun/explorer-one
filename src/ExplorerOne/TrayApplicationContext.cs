@@ -68,6 +68,12 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             _logsItem.Click += OnOpenLogsClick;
             _exitItem.Click += OnExitClick;
 
+            try { StartupRegistration.MigrateIfEnabled(); }
+            catch (Exception exception)
+            {
+                // A failed migration leaves the previous registration intact.
+                AppDiagnostics.Error("startup_migration_failed", exception);
+            }
             try
             {
                 _autoStartEnabled = StartupRegistration.IsEnabled();

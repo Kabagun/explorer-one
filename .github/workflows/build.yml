@@ -29,6 +29,9 @@ jobs:
         shell: pwsh
         run: ./tests/ExplorerOne.Native.Tests/run.ps1
 
+      - name: Run startup registration tests
+        run: dotnet run --project tests/ExplorerOne.Startup.Tests -c Release
+
       - name: Build application
         run: dotnet build src/ExplorerOne/ExplorerOne.csproj -c Release
 

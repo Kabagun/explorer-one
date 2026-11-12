@@ -1,5 +1,6 @@
 #include "FolderTabRouting.h"
 #include "TargetFolderBridge.h"
+#include "ExplorerFrameProfile.h"
 
 #include <bcrypt.h>
 #include <exdisp.h>
@@ -26,17 +27,6 @@ namespace {
 constexpr size_t MaximumTabs = 512;
 constexpr DWORD NativeCreationTimeout = 2000;
 constexpr DWORD HandshakeTimeout = 6000;
-constexpr DWORD KnownTimestamp = 0xFD64D9D7;
-constexpr DWORD KnownImageSize = 0x00323000;
-constexpr DWORD BrowseRva = 0x133BA0;
-constexpr LONGLONG KnownFileSize = 3268608;
-constexpr std::array<BYTE, 32> KnownHash = {
-    0xb7, 0xbd, 0xa6, 0x01, 0x1c, 0x0c, 0x13, 0xa8,
-    0x1a, 0x6e, 0xa9, 0x67, 0x07, 0x89, 0xc3, 0xec,
-    0xb2, 0x41, 0xca, 0xf9, 0x94, 0xd3, 0x1e, 0x27,
-    0x4a, 0xdd, 0x18, 0x70, 0x49, 0x29, 0xca, 0x6d
-};
-
 // These are the native interfaces used by Explorer's browser creation path.
 // V2 must be queried independently; a base interface has only slots 0..7.
 MIDL_INTERFACE("6aca2690-0de1-46c9-a1c5-9338a22bf12b")
@@ -195,7 +185,7 @@ bool ReadAt(HANDLE file, LONGLONG offset, void* buffer, DWORD size) noexcept {
         ReadFile(file, buffer, size, &read, nullptr) && read == size;
 }
 
-bool FileHashMatches(HANDLE file) {
+bool FileHashMatches(HANDLE file, const ExplorerFrameProfile& profile) {
     struct Algorithm final {
         BCRYPT_ALG_HANDLE value = nullptr;
         ~Algorithm() { if (value) BCryptCloseAlgorithmProvider(value, 0); }
@@ -223,7 +213,7 @@ bool FileHashMatches(HANDLE file) {
     }
     std::array<BYTE, 32> actual{};
     return BCryptFinishHash(hash.value, actual.data(), static_cast<ULONG>(actual.size()), 0) >= 0 &&
-        actual == KnownHash;
+        actual == profile.sha256;
 }
 
 bool ReadRemote(HANDLE process, const BYTE* address, void* bytes, SIZE_T size) noexcept {
@@ -236,10 +226,13 @@ struct VerifiedModule final {
     ULONGLONG processStart = 0;
     BYTE* base = nullptr;
     std::array<BYTE, 32> code{};
+    const ExplorerFrameProfile* profile = nullptr;
     Handle file;
 };
 
 bool VerifiedMemoryCurrent(HANDLE process, const VerifiedModule& module) noexcept {
+    if (!module.profile) return false;
+    const auto& profile = *module.profile;
     MEMORY_BASIC_INFORMATION memory{};
     IMAGE_DOS_HEADER dos{};
     IMAGE_NT_HEADERS64 header{};
@@ -250,9 +243,9 @@ bool VerifiedMemoryCurrent(HANDLE process, const VerifiedModule& module) noexcep
         dos.e_lfanew >= 64 && dos.e_lfanew <= 4096 &&
         ReadRemote(process, module.base + dos.e_lfanew, &header, sizeof(header)) &&
         header.Signature == IMAGE_NT_SIGNATURE && header.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
-        header.FileHeader.TimeDateStamp == KnownTimestamp && header.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
-        header.OptionalHeader.SizeOfImage == KnownImageSize &&
-        ReadRemote(process, module.base + BrowseRva, code.data(), code.size()) && code == module.code;
+        header.FileHeader.TimeDateStamp == profile.timestamp && header.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC &&
+        header.OptionalHeader.SizeOfImage == profile.imageSize &&
+        ReadRemote(process, module.base + profile.browseRva, code.data(), code.size()) && code == module.code;
 }
 
 bool VerifyBrowserCode(const RoutingTarget& target, HANDLE process) {
@@ -273,12 +266,14 @@ bool VerifyBrowserCode(const RoutingTarget& target, HANDLE process) {
     MODULEENTRY32W row{};
     row.dwSize = sizeof(row);
     BYTE* base = nullptr;
+    DWORD mappedSize = 0;
     wchar_t modulePath[MAX_PATH]{};
     if (!Module32FirstW(modules.value, &row)) return false;
     do {
         if (_wcsicmp(row.szModule, L"ExplorerFrame.dll") != 0) continue;
-        if (base || row.modBaseSize != KnownImageSize || !row.modBaseAddr) return false;
+        if (base || !row.modBaseAddr) return false;
         base = row.modBaseAddr;
+        mappedSize = row.modBaseSize;
         wcscpy_s(modulePath, row.szExePath);
     } while (Module32NextW(modules.value, &row));
     if (!base) return false;
@@ -293,7 +288,7 @@ bool VerifyBrowserCode(const RoutingTarget& target, HANDLE process) {
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     LARGE_INTEGER fileSize{};
     if (!moduleFile || !GetFileSizeEx(moduleFile.value, &fileSize) ||
-        fileSize.QuadPart != KnownFileSize || !FileHashMatches(moduleFile.value)) return false;
+        fileSize.QuadPart <= 0) return false;
     IMAGE_DOS_HEADER remoteDos{}, diskDos{};
     if (!ReadRemote(process, base, &remoteDos, sizeof(remoteDos)) ||
         remoteDos.e_magic != IMAGE_DOS_SIGNATURE || remoteDos.e_lfanew < 64 || remoteDos.e_lfanew > 4096 ||
@@ -303,10 +298,15 @@ bool VerifyBrowserCode(const RoutingTarget& target, HANDLE process) {
     if (!ReadRemote(process, base + remoteDos.e_lfanew, &remote, sizeof(remote)) ||
         !ReadAt(moduleFile.value, diskDos.e_lfanew, &disk, sizeof(disk)) ||
         remote.Signature != IMAGE_NT_SIGNATURE || remote.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
-        remote.FileHeader.TimeDateStamp != KnownTimestamp || remote.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        remote.OptionalHeader.SizeOfImage != KnownImageSize ||
+        remote.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
         disk.FileHeader.NumberOfSections == 0 || disk.FileHeader.NumberOfSections > 128 ||
         disk.FileHeader.SizeOfOptionalHeader < sizeof(IMAGE_OPTIONAL_HEADER64)) return false;
+    const auto* selected = FindExplorerFrameProfile(fileSize.QuadPart, disk.FileHeader.TimeDateStamp, disk.OptionalHeader.SizeOfImage);
+    if (!selected || disk.Signature != IMAGE_NT_SIGNATURE || disk.FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        disk.OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        remote.FileHeader.TimeDateStamp != selected->timestamp || remote.OptionalHeader.SizeOfImage != selected->imageSize ||
+        mappedSize != selected->imageSize || !FileHashMatches(moduleFile.value, *selected)) return false;
+    const auto& profile = *selected;
     LONGLONG methodOffset = -1;
     const LONGLONG sections = diskDos.e_lfanew + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER) +
         disk.FileHeader.SizeOfOptionalHeader;
@@ -314,18 +314,19 @@ bool VerifyBrowserCode(const RoutingTarget& target, HANDLE process) {
         IMAGE_SECTION_HEADER section{};
         if (!ReadAt(moduleFile.value, sections + static_cast<LONGLONG>(index) * sizeof(section),
             &section, sizeof(section))) return false;
-        if (BrowseRva >= section.VirtualAddress && BrowseRva - section.VirtualAddress <= section.SizeOfRawData &&
-            section.SizeOfRawData - (BrowseRva - section.VirtualAddress) >= 32)
-            methodOffset = static_cast<LONGLONG>(section.PointerToRawData) + BrowseRva - section.VirtualAddress;
+        if (profile.browseRva >= section.VirtualAddress && profile.browseRva - section.VirtualAddress <= section.SizeOfRawData &&
+            section.SizeOfRawData - (profile.browseRva - section.VirtualAddress) >= 32)
+            methodOffset = static_cast<LONGLONG>(section.PointerToRawData) + profile.browseRva - section.VirtualAddress;
     }
     std::array<BYTE, 32> expectedCode{}, actualCode{};
-    if (!(methodOffset >= 0 && methodOffset + static_cast<LONGLONG>(expectedCode.size()) <= KnownFileSize &&
+    if (!(methodOffset >= 0 && methodOffset + static_cast<LONGLONG>(expectedCode.size()) <= profile.fileSize &&
         ReadAt(moduleFile.value, methodOffset, expectedCode.data(), static_cast<DWORD>(expectedCode.size())) &&
-        ReadRemote(process, base + BrowseRva, actualCode.data(), actualCode.size()) && expectedCode == actualCode)) return false;
+        ReadRemote(process, base + profile.browseRva, actualCode.data(), actualCode.size()) && expectedCode == actualCode)) return false;
     verified.pid = target.pid;
     verified.processStart = target.processStart;
     verified.base = base;
     verified.code = expectedCode;
+    verified.profile = selected;
     verified.file.value = moduleFile.value;
     moduleFile.value = nullptr;
     return true;

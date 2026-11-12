@@ -25,7 +25,7 @@ New-Item -ItemType Directory -Path $OutputDirectory -Force | Out-Null
 $vendor = 'vendor/minhook-1.3.4'
 $cppSources = @('NativeLaunchRouter.cpp', 'FolderTabRouting.cpp', 'NativeRouteQueue.cpp', 'TargetFolderBridge.cpp', 'NativeSourcePresentation.cpp')
 $cSources = @("$vendor/src/buffer.c", "$vendor/src/hook.c", "$vendor/src/trampoline.c", "$vendor/src/hde/hde64.c")
-$inputs = @('build.ps1', 'NativeLaunchRouter.cpp', 'NativeLaunchProtocol.h', 'FolderTabRouting.cpp', 'FolderTabRouting.h', 'NativeRouteQueue.cpp', 'NativeRouteQueue.h', 'TargetFolderBridge.cpp', 'TargetFolderBridge.h', 'TargetFolderProtocol.h', 'NativeSourcePresentation.cpp', 'NativeSourcePresentation.h')
+$inputs = @('build.ps1', 'ExplorerFrameProfile.h', 'NativeLaunchRouter.cpp', 'NativeLaunchProtocol.h', 'FolderTabRouting.cpp', 'FolderTabRouting.h', 'NativeRouteQueue.cpp', 'NativeRouteQueue.h', 'TargetFolderBridge.cpp', 'TargetFolderBridge.h', 'TargetFolderProtocol.h', 'NativeSourcePresentation.cpp', 'NativeSourcePresentation.h')
 $inputs += Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot $vendor) -Recurse -File | ForEach-Object { [System.IO.Path]::GetRelativePath($PSScriptRoot, $_.FullName).Replace('\', '/') }
 $fingerprints = $inputs | Sort-Object -Unique | ForEach-Object {
     $path = Join-Path $PSScriptRoot $_
