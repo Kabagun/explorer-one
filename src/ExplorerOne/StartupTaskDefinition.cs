@@ -38,7 +38,7 @@ internal static class StartupTaskDefinition
                     })))).ToString();
     }
 
-    public static bool Matches(string xml, string executablePath, string userSid, string? userName = null)
+    public static bool Matches(string xml, string? executablePath, string userSid, string? userName = null)
     {
         try
         {
@@ -55,7 +55,10 @@ internal static class StartupTaskDefinition
                 && IsCurrentUser((string?)principal?.Element(Namespace + "UserId"))
                 && (string?)principal?.Element(Namespace + "LogonType") == "InteractiveToken"
                 && ((string?)principal?.Element(Namespace + "RunLevel") is null or "LeastPrivilege")
-                && command is not null && PathsEqual(command, executablePath)
+                && command is not null && Path.IsPathFullyQualified(command)
+                && (executablePath is null
+                    ? Path.GetFileName(command).Equals("ExplorerOne.exe", StringComparison.OrdinalIgnoreCase)
+                    : PathsEqual(command, executablePath))
                 && string.IsNullOrEmpty((string?)actions![0].Element(Namespace + "Arguments"));
         }
         catch (Exception exception) when (exception is System.Xml.XmlException or InvalidOperationException or ArgumentException or NotSupportedException)

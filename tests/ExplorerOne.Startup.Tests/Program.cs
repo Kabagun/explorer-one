@@ -7,6 +7,9 @@ var executable = @"C:\Portable apps\ExplorerOne & tools\ExplorerOne.exe";
 XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 var xml = StartupTaskDefinition.Create(executable, userSid);
 Check(StartupTaskDefinition.Matches(xml, executable, userSid), "Valid task and XML-escaped executable match.");
+Check(StartupTaskDefinition.Matches(xml, null, userSid), "Setup detects an enabled registration from a portable location.");
+Check(!StartupTaskDefinition.Matches(StartupTaskDefinition.Create(@"C:\Other\SomethingElse.exe", userSid), null, userSid),
+    "Setup does not count a task pointing at another executable.");
 Check(!StartupTaskDefinition.Matches(xml, @"C:\Other\ExplorerOne.exe", userSid), "A stale executable registration is rejected.");
 Check(!StartupTaskDefinition.Matches(xml, executable, "S-1-5-21-100-200-300-1001"), "Another user is rejected.");
 Check(!StartupTaskDefinition.Matches("broken xml", executable, userSid), "Corrupt registration is rejected.");

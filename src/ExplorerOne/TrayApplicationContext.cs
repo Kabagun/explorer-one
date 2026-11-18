@@ -38,6 +38,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         Visible = false
     };
     private readonly System.Windows.Forms.Timer _pollTimer = new() { Interval = MinimumPendingPollMilliseconds };
+    private readonly EventWaitHandle? _shutdownRequest;
 
     private Task? _activePoll;
     private long _registrationBurstUntil;
@@ -50,8 +51,9 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
     private long _nextCapturePrimeAttemptAt;
     private bool _capturePrimed;
 
-    public TrayApplicationContext(bool enableStartup = false)
+    public TrayApplicationContext(EventWaitHandle? shutdownRequest = null)
     {
+        _shutdownRequest = shutdownRequest;
         try
         {
             _menu.Items.Add(_statusItem);
@@ -70,8 +72,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
 
             try
             {
-                if (enableStartup) StartupRegistration.SetEnabled(true);
-                else StartupRegistration.MigrateIfEnabled();
+                StartupRegistration.MigrateIfEnabled();
             }
             catch (Exception exception)
             {
@@ -110,6 +111,12 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
         _pollTimer.Stop();
         if (_shuttingDown)
             return;
+        if (_shutdownRequest?.WaitOne(0) == true)
+        {
+            AppDiagnostics.ShutdownRequested("setup_exit");
+            _ = ShutdownSafelyAsync();
+            return;
+        }
 
         _presentation?.Observe(_coordinator?.MainWindow);
         if (_activePoll is { IsCompleted: false })

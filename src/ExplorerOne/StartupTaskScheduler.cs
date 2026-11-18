@@ -36,7 +36,7 @@ internal sealed class StartupTaskScheduler : IDisposable
         }
     }
 
-    public bool IsEnabled(string executablePath)
+    public bool IsEnabled(string? executablePath)
     {
         try
         {

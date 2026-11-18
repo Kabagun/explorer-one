@@ -35,21 +35,21 @@ jobs:
       - name: Build application
         run: dotnet build src/ExplorerOne/ExplorerOne.csproj -c Release
 
-      - name: Publish self-contained Windows x64 application
-        run: dotnet publish src/ExplorerOne/ExplorerOne.csproj -c Release -r win-x64 --self-contained true -o publish/ExplorerOne-win-x64
+      - name: Publish Windows x64 application
+        run: dotnet publish src/ExplorerOne/ExplorerOne.csproj -c Release -r win-x64 --self-contained false -o publish/ExplorerOne-win-x64
 
-      - name: Package portable archive
+      - name: Build Windows installer
         shell: pwsh
         run: |
           Copy-Item LICENSE, THIRD-PARTY-NOTICES.md, README.md -Destination publish/ExplorerOne-win-x64/
           New-Item -ItemType Directory -Path publish/ExplorerOne-win-x64/docs -Force | Out-Null
           Copy-Item docs/manual-tests.md, docs/verification.md -Destination publish/ExplorerOne-win-x64/docs/
-          Compress-Archive -Path publish/ExplorerOne-win-x64/* -DestinationPath ExplorerOne-win-x64.zip
+          ./installer/build.ps1 -PublishedDirectory publish/ExplorerOne-win-x64 -OutputDirectory outputs
 
-      - name: Upload Windows x64 artifact
+      - name: Upload Windows x64 installer
         uses: actions/upload-artifact@v4
         with:
-          name: ExplorerOne-win-x64
-          path: ExplorerOne-win-x64.zip
+          name: ExplorerOne-Setup-win-x64
+          path: outputs/ExplorerOne-Setup-*-win-x64.exe
           if-no-files-found: error
           retention-days: 30

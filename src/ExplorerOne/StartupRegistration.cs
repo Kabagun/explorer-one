@@ -16,6 +16,14 @@ internal static class StartupRegistration
         return taskEnabled || IsLegacyEnabled();
     }
 
+    // Setup preserves the existing preference even when installing to a new
+    // path. The tray continues to check whether its own executable is selected.
+    public static bool HasEnabledRegistration()
+    {
+        using var scheduler = new StartupTaskScheduler();
+        return scheduler.IsEnabled(null) || IsLegacyEnabled();
+    }
+
     /// <summary>Called at startup once the app is running; read-only status checks never change registration.</summary>
     public static void MigrateIfEnabled()
     {

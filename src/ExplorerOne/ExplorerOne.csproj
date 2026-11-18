@@ -9,6 +9,8 @@
     <Description>One native Windows Explorer window with tabs</Description>
     <Authors>Kabaye</Authors>
     <PlatformTarget>x64</PlatformTarget>
+    <AppHostDotNetSearch Condition="'$(SelfContained)' != 'true'">AppRelative;Global</AppHostDotNetSearch>
+    <AppHostRelativeDotNet Condition="'$(SelfContained)' != 'true'">dotnet</AppHostRelativeDotNet>
     <ExplorerOnePowerShell Condition="'$(ExplorerOnePowerShell)' == '' and Exists('$(USERPROFILE)/Programs/PowerShell/7/pwsh.exe')">$(USERPROFILE)/Programs/PowerShell/7/pwsh.exe</ExplorerOnePowerShell>
     <ExplorerOnePowerShell Condition="'$(ExplorerOnePowerShell)' == ''">pwsh.exe</ExplorerOnePowerShell>
   </PropertyGroup>
