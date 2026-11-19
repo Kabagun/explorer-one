@@ -9,7 +9,7 @@ param(
     [string] $IsccPath,
 
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string] $Version = '1.0.0'
+    [string] $Version
 )
 
 $ErrorActionPreference = 'Stop'
@@ -77,6 +77,18 @@ function Get-NativeRouterPayload {
 }
 
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
+if (-not $Version) {
+    $versionPropsPath = Join-Path $repositoryRoot 'Directory.Build.props'
+    if (-not (Test-Path -LiteralPath $versionPropsPath -PathType Leaf)) {
+        throw "Cannot derive installer version; Directory.Build.props not found at $versionPropsPath"
+    }
+    [xml] $versionProps = Get-Content -LiteralPath $versionPropsPath -Raw
+    $versionNode = $versionProps.SelectSingleNode('/Project/PropertyGroup/Version')
+    if (-not $versionNode -or $versionNode.InnerText -notmatch '^\d+\.\d+\.\d+$') {
+        throw "Directory.Build.props must define a numeric three-part Version for setup metadata."
+    }
+    $Version = $versionNode.InnerText
+}
 $publishedRoot = (Resolve-Path -LiteralPath $PublishedDirectory -ErrorAction Stop).Path
 if (-not (Test-Path -LiteralPath $publishedRoot -PathType Container)) {
     throw "Published directory does not exist: $PublishedDirectory"

@@ -18,6 +18,7 @@ AppPublisher=ExplorerOne
 AppPublisherURL=https://github.com/Kabagun/explorer-one
 AppSupportURL=https://github.com/Kabagun/explorer-one/issues
 AppUpdatesURL=https://github.com/Kabagun/explorer-one/releases
+SetupMutex=ExplorerOne.Setup.D47627FB-9A4B-49AD-8B52-444733D91F80
 DefaultDirName={localappdata}\Programs\ExplorerOne
 DefaultGroupName=ExplorerOne
 DisableProgramGroupPage=yes
@@ -73,7 +74,7 @@ russian.UninstallMissingExe=Файл ExplorerOne.exe отсутствует, п�
 russian.RetainedRouterNotice=Windows всё ещё использует один или несколько нативных файлов маршрутизатора ExplorerOne. Они оставлены в этой папке; удалите их после перезапуска Проводника:%n%n%1
 
 [Tasks]
-Name: "startup"; Description: "{cm:EnableStartup}"; GroupDescription: "{cm:TaskGroup}"; Flags: unchecked
+Name: "startup"; Description: "{cm:EnableStartup}"; GroupDescription: "{cm:TaskGroup}"; Flags: unchecked; Check: IncludeStartupTask
 
 [Files]
 Source: "{#PublishedDirectory}*"; DestDir: "{app}"; Excludes: "ExplorerOne.NativeLaunchRouter.v1.*.dll"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -96,13 +97,193 @@ var
   RuntimeProvisioned: Boolean;
   TaskSelectionWasExplicit: Boolean;
   RuntimeDownloadPage: TDownloadWizardPage;
+  UpdateMode: Boolean;
+  UpdatePathValidated: Boolean;
+  UpdateAppWasStopped: Boolean;
+  RegisteredInstallDirectory: String;
+  RegisteredAppExecutable: String;
+  RegisteredUninstaller: String;
 
 const
   RouterManifestName = 'ExplorerOne.NativeLaunchRouter.manifest';
   RouterNamePrefix = 'ExplorerOne.NativeLaunchRouter.v1.';
+  UpdateUninstallKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{D47627FB-9A4B-49AD-8B52-444733D91F80}_is1';
 
 function SetEnvironmentVariable(lpName, lpValue: String): Boolean;
   external 'SetEnvironmentVariableW@kernel32.dll stdcall';
+
+function IsUpdateSwitchPresent: Boolean;
+var
+  Index: Integer;
+  Argument: String;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do begin
+    Argument := Lowercase(ParamStr(Index));
+    if (Argument = '/exploreroneupdate') or
+       (Argument = '/exploreroneupdate=1') then begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function IncludeStartupTask: Boolean;
+begin
+  Result := not UpdateMode;
+end;
+
+function ExtractCommandExecutable(const CommandLine: String): String;
+var
+  ClosingQuote: Integer;
+  FirstSpace: Integer;
+begin
+  Result := '';
+  if CommandLine = '' then
+    Exit;
+  if CommandLine[1] = '"' then begin
+    ClosingQuote := Pos('"', Copy(CommandLine, 2, MaxInt));
+    if ClosingQuote = 0 then
+      Exit;
+    Result := Copy(CommandLine, 2, ClosingQuote - 1);
+  end else begin
+    FirstSpace := Pos(' ', CommandLine);
+    if FirstSpace = 0 then
+      Result := CommandLine
+    else
+      Result := Copy(CommandLine, 1, FirstSpace - 1);
+  end;
+end;
+
+function IsValidUninstallerName(const FileName: String): Boolean;
+var
+  Index: Integer;
+  Character: String;
+begin
+  Result := False;
+  if (Length(FileName) <> 12) or
+     (CompareText(Copy(FileName, 1, 5), 'unins') <> 0) or
+     (CompareText(Copy(FileName, 9, 4), '.exe') <> 0) then
+    Exit;
+  for Index := 6 to 8 do begin
+    Character := Copy(FileName, Index, 1);
+    if Pos(Character, '0123456789') = 0 then
+      Exit;
+  end;
+  Result := True;
+end;
+
+function ParseNumericVersion(const Value: String; var Major, Minor, Patch: Integer): Boolean;
+var
+  FirstDot: Integer;
+  SecondDot: Integer;
+  Parts: array[0..2] of String;
+  PartIndex: Integer;
+  CharacterIndex: Integer;
+  Character: String;
+begin
+  Result := False;
+  FirstDot := Pos('.', Value);
+  if FirstDot = 0 then
+    Exit;
+  SecondDot := Pos('.', Copy(Value, FirstDot + 1, MaxInt));
+  if SecondDot = 0 then
+    Exit;
+  SecondDot := FirstDot + SecondDot;
+  if Pos('.', Copy(Value, SecondDot + 1, MaxInt)) <> 0 then
+    Exit;
+  Parts[0] := Copy(Value, 1, FirstDot - 1);
+  Parts[1] := Copy(Value, FirstDot + 1, SecondDot - FirstDot - 1);
+  Parts[2] := Copy(Value, SecondDot + 1, MaxInt);
+  for PartIndex := 0 to 2 do begin
+    if Parts[PartIndex] = '' then
+      Exit;
+    for CharacterIndex := 1 to Length(Parts[PartIndex]) do begin
+      Character := Copy(Parts[PartIndex], CharacterIndex, 1);
+      if Pos(Character, '0123456789') = 0 then
+        Exit;
+    end;
+  end;
+  Major := StrToIntDef(Parts[0], -1);
+  Minor := StrToIntDef(Parts[1], -1);
+  Patch := StrToIntDef(Parts[2], -1);
+  Result := (Major >= 0) and (Minor >= 0) and (Patch >= 0);
+end;
+
+function IsIncomingVersionHigher(const InstalledVersion: String): Boolean;
+var
+  NewMajor: Integer;
+  NewMinor: Integer;
+  NewPatch: Integer;
+  OldMajor: Integer;
+  OldMinor: Integer;
+  OldPatch: Integer;
+begin
+  Result := False;
+  if not ParseNumericVersion('{#ProductVersion}', NewMajor, NewMinor, NewPatch) or
+     not ParseNumericVersion(InstalledVersion, OldMajor, OldMinor, OldPatch) then
+    Exit;
+  Result := (NewMajor > OldMajor) or
+    ((NewMajor = OldMajor) and (NewMinor > OldMinor)) or
+    ((NewMajor = OldMajor) and (NewMinor = OldMinor) and (NewPatch > OldPatch));
+end;
+
+function NormalizeDirectoryPath(const Value: String): String;
+begin
+  Result := ExpandFileName(Trim(Value));
+  while (Length(Result) > 3) and (Copy(Result, Length(Result), 1) = '\') do
+    Delete(Result, Length(Result), 1);
+end;
+
+function InitializeSetup: Boolean;
+var
+  UninstallString: String;
+  DisplayVersion: String;
+  StoredInstallDirectory: String;
+  UninstallerDirectory: String;
+begin
+  UpdateMode := IsUpdateSwitchPresent;
+  UpdateAppWasStopped := False;
+  UpdatePathValidated := False;
+  Result := True;
+  if not UpdateMode then
+    Exit;
+
+  Log('ExplorerOne self-update mode requested.');
+  if not RegQueryStringValue(HKCU, UpdateUninstallKey, 'InstallLocation', StoredInstallDirectory) or
+     not RegQueryStringValue(HKCU, UpdateUninstallKey, 'UninstallString', UninstallString) or
+     not RegQueryStringValue(HKCU, UpdateUninstallKey, 'DisplayVersion', DisplayVersion) then begin
+    Log('Self-update refused: the current-user ExplorerOne uninstall registration is incomplete.');
+    SuppressibleMsgBox('ExplorerOne update refused: no valid per-user installation is registered.', mbError, MB_OK, 0);
+    Result := False;
+    Exit;
+  end;
+
+  RegisteredInstallDirectory := NormalizeDirectoryPath(StoredInstallDirectory);
+  RegisteredAppExecutable := AddBackslash(RegisteredInstallDirectory) + 'ExplorerOne.exe';
+  RegisteredUninstaller := ExpandFileName(ExtractCommandExecutable(UninstallString));
+  UninstallerDirectory := NormalizeDirectoryPath(ExtractFileDir(RegisteredUninstaller));
+  if (RegisteredInstallDirectory = '') or
+     (CompareText(UninstallerDirectory, RegisteredInstallDirectory) <> 0) or
+     not IsValidUninstallerName(ExtractFileName(RegisteredUninstaller)) or
+     not FileExists(RegisteredAppExecutable) or
+     not FileExists(RegisteredUninstaller) then begin
+    Log('Self-update refused: registered executable/uninstaller paths do not match the existing install directory.');
+    SuppressibleMsgBox('ExplorerOne update refused: the registered installation paths are invalid.', mbError, MB_OK, 0);
+    Result := False;
+    Exit;
+  end;
+
+  if not IsIncomingVersionHigher(DisplayVersion) then begin
+    Log(Format('Self-update refused: incoming version %s is not higher than installed version %s.', ['{#ProductVersion}', DisplayVersion]));
+    SuppressibleMsgBox('ExplorerOne update refused: this installer is not newer than the installed version.', mbError, MB_OK, 0);
+    Result := False;
+    Exit;
+  end;
+
+  UpdatePathValidated := True;
+  Log(Format('Validated per-user update target: %s (installed version %s).', [RegisteredInstallDirectory, DisplayVersion]));
+end;
 
 function RunPayloadCommand(const Parameters: String; var ExitCode: Integer): Boolean;
 begin
@@ -385,6 +566,16 @@ begin
   RuntimeProvisioned := False;
   TaskSelectionWasExplicit := HasExplicitTaskSelection;
   RuntimeDownloadPage := CreateDownloadPage(SetupMessage(msgWizardPreparing), SetupMessage(msgWizardPreparing), nil);
+  if UpdateMode then begin
+    WizardForm.DirEdit.Text := RegisteredInstallDirectory;
+    if CompareText(NormalizeDirectoryPath(WizardDirValue), RegisteredInstallDirectory) <> 0 then begin
+      Log('Self-update refused: Setup could not select the registered installation directory.');
+      StartupStateCheckFailed := True;
+      Exit;
+    end;
+    if TaskSelectionWasExplicit then
+      Log('Ignoring /TASKS in update mode; the existing startup registration will be preserved.');
+  end;
   try
     ExtractTemporaryFiles('{app}\*');
   except
@@ -400,7 +591,10 @@ begin
       Exit;
     end;
   end;
-  if RunPayloadCommand('--startup-status', ExitCode) then begin
+  if UpdateMode then begin
+    StartupStateCheckFailed := False;
+    Log('Update mode will preserve the existing startup registration without changing it.');
+  end else if RunPayloadCommand('--startup-status', ExitCode) then begin
     if ExitCode = 0 then begin
       StartupStateWasActive := True;
       StartupStateCheckFailed := False;
@@ -422,7 +616,19 @@ var
   ExitCode: Integer;
 begin
   Result := '';
-  if StartupStateCheckFailed or not RunPayloadCommand('--startup-status', ExitCode) or
+  if StartupStateCheckFailed then begin
+    Log('Setup stopped before shutdown because runtime or payload preflight was not successful.');
+    Result := 'ExplorerOne Setup could not validate its payload and runtime. No application files were changed.';
+    Exit;
+  end;
+  if UpdateMode then begin
+    if not UpdatePathValidated or
+       (CompareText(NormalizeDirectoryPath(WizardDirValue), RegisteredInstallDirectory) <> 0) then begin
+      Log('Self-update refused: final target does not match the registered per-user installation.');
+      Result := 'ExplorerOne update refused: the target directory changed after validation.';
+      Exit;
+    end;
+  end else if StartupStateCheckFailed or not RunPayloadCommand('--startup-status', ExitCode) or
      ((ExitCode <> 0) and (ExitCode <> 1)) then begin
     Result := CustomMessage('StartupStatusError');
     Exit;
@@ -436,6 +642,10 @@ begin
     Result := FmtMessage(CustomMessage('ShutdownError'), [IntToStr(ExitCode)]);
     Exit;
   end;
+  if UpdateMode then begin
+    UpdateAppWasStopped := True;
+    Log('Validated installed ExplorerOne instance stopped gracefully for update.');
+  end;
 
   { Capture before [Files] replaces the current-pointer file. Do cleanup only
     after all application files have been installed successfully. }
@@ -446,7 +656,7 @@ end;
 
 function AllowLaunch: Boolean;
 begin
-  Result := LaunchAllowed;
+  Result := LaunchAllowed and not UpdateMode;
 end;
 
 function IsRuntimeProvisioned: Boolean;
@@ -466,27 +676,47 @@ var
   Started: Boolean;
 begin
   if CurStep = ssPostInstall then begin
-    if WizardIsTaskSelected('startup') then
-      Command := '--enable-startup'
-    else
-      Command := '--disable-startup';
-    Started := RunInstalledCommand(Command, ExitCode);
-    if not Started or (ExitCode <> 0) then begin
-      LaunchAllowed := False;
-      if Started then begin
-        if Command = '--enable-startup' then
-          Log(Format('Startup enable failed with exit code %d.', [ExitCode]))
-        else
-          Log(Format('Startup disable failed with exit code %d.', [ExitCode]));
-      end else
-        Log('Could not start the startup configuration command.');
+    if UpdateMode then
+      Log('Update completed; the existing startup registration was left untouched.')
+    else begin
       if WizardIsTaskSelected('startup') then
-        SuppressibleMsgBox(FmtMessage(CustomMessage('StartupEnableError'), [IntToStr(ExitCode)]), mbError, MB_OK, 0)
+        Command := '--enable-startup'
       else
-        SuppressibleMsgBox(FmtMessage(CustomMessage('StartupDisableError'), [IntToStr(ExitCode)]), mbError, MB_OK, 0);
+        Command := '--disable-startup';
+      Started := RunInstalledCommand(Command, ExitCode);
+      if not Started or (ExitCode <> 0) then begin
+        LaunchAllowed := False;
+        if Started then begin
+          if Command = '--enable-startup' then
+            Log(Format('Startup enable failed with exit code %d.', [ExitCode]))
+          else
+            Log(Format('Startup disable failed with exit code %d.', [ExitCode]));
+        end else
+          Log('Could not start the startup configuration command.');
+        if WizardIsTaskSelected('startup') then
+          SuppressibleMsgBox(FmtMessage(CustomMessage('StartupEnableError'), [IntToStr(ExitCode)]), mbError, MB_OK, 0)
+        else
+          SuppressibleMsgBox(FmtMessage(CustomMessage('StartupDisableError'), [IntToStr(ExitCode)]), mbError, MB_OK, 0);
+      end;
     end;
     CleanupCapturedRouterModules(True);
     SaveRouterManifest;
+  end;
+end;
+
+procedure DeinitializeSetup;
+var
+  ExitCode: Integer;
+begin
+  if UpdateMode and UpdateAppWasStopped then begin
+    if FileExists(RegisteredAppExecutable) then begin
+      Log(Format('Relaunching ExplorerOne from the validated registered path: %s', [RegisteredAppExecutable]));
+      if not Exec(RegisteredAppExecutable, '', RegisteredInstallDirectory, SW_SHOWNORMAL, ewNoWait, ExitCode) then
+        Log('Could not relaunch ExplorerOne after update; the validated executable remains installed.')
+      else
+        Log('ExplorerOne relaunch request completed.');
+    end else
+      Log('ExplorerOne was stopped for update but the validated executable is missing; relaunch skipped.');
   end;
 end;
 

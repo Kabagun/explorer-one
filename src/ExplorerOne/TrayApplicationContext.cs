@@ -93,6 +93,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
 
             _notifyIcon.Visible = true;
             InitializeFolderOpening();
+            InitializeUpdates();
             _pollTimer.Start();
         }
         catch
@@ -420,6 +421,7 @@ internal sealed partial class TrayApplicationContext : ApplicationContext
             return;
 
         _shuttingDown = true;
+        StopUpdates();
         _nativeReservations.StopPreopening();
         try
         {

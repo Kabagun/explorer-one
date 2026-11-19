@@ -8,4 +8,5 @@
   <ItemGroup><Compile Include="../../src/ExplorerOne/Opening/NativeSourceAppearance.cs" Link="Opening/NativeSourceAppearance.cs" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/Shell/NativeTabReservations.cs" Link="NativeTabReservations.cs" /></ItemGroup>
   <ItemGroup><Compile Include="../../src/ExplorerOne/Diagnostics/DiagnosticJournal.cs" Link="Diagnostics/DiagnosticJournal.cs" /></ItemGroup>
+  <ItemGroup><Compile Include="../../src/ExplorerOne/Updating/GitHubUpdateClient.cs" Link="Updating/GitHubUpdateClient.cs" /></ItemGroup>
 </Project>

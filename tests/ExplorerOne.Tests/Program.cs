@@ -204,6 +204,9 @@ cases = cases.Concat(LatencyCases.All).ToArray();
 cases = cases.Concat(PresentationCases.All).ToArray();
 cases = cases.Concat(NativeTabReservationCases.All).ToArray();
 cases = cases.Concat(DiagnosticsCases.All).ToArray();
+cases = cases.Concat(UpdateCases.All).ToArray();
+if (args.Contains("--public-release"))
+    cases = cases.Append(("Check and verify the real GitHub release without starting it", UpdateCases.CheckPublicRelease)).ToArray();
 var failures = 0;
 foreach (var test in cases)
 {
